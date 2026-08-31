@@ -58,19 +58,29 @@ public enum ProtocolIO {
     /// `write(2)` on a pipe returns short. Without the loop a large `tools/list` response
     /// silently truncates into invalid JSON under backpressure.
     private static func writeAll(_ data: Data, to descriptor: Int32) {
-        data.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
+        let bytesWritten: Int = data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return 0 }
             var offset = 0
             while offset < raw.count {
                 let written = write(descriptor, base.advanced(by: offset), raw.count - offset)
                 if written < 0 {
                     if errno == EINTR { continue }
                     Log.shared.error("mcp.write_failed", ["errno": .int(Int(errno))])
-                    return
+                    return offset
                 }
                 offset += written
             }
+            return offset
         }
+        guard bytesWritten < data.count else { return }
+        // A partial frame with no trailing newline would be concatenated onto the *next*
+        // frame, turning one dropped response into a corrupt stream. Terminate it so the
+        // peer discards one unparseable line instead.
+        var newline: UInt8 = 0x0A
+        _ = withUnsafeBytes(of: &newline) { write(descriptor, $0.baseAddress, 1) }
+        Log.shared.error("mcp.frame_truncated", [
+            "written": .int(bytesWritten), "expected": .int(data.count),
+        ])
     }
 
     /// Read newline-delimited frames from stdin until EOF.

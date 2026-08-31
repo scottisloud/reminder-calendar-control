@@ -30,7 +30,21 @@ else
 fi
 [ -f "$BIN_PATH" ] || die "no binary at $BIN_PATH"
 
+# --skip-build takes SwiftPM's raw output, which is only linker-signed: Identifier is the
+# filename and the embedded Info.plist is NOT bound into the signature, so the usage strings
+# TCC needs are unsealed. Refuse to install that at the authoritative path.
+if codesign -dvvv "$BIN_PATH" 2>&1 | grep -q 'linker-signed'; then
+  die "$BIN_PATH is only linker-signed — its Info.plist is not sealed.
+      Run Scripts/build-release.sh (or Scripts/sign.sh --allow-adhoc \"$BIN_PATH\") first."
+fi
+codesign --verify --strict "$BIN_PATH" || die "signature verification failed for $BIN_PATH"
+codesign -dvvv "$BIN_PATH" 2>&1 | grep -q '^Info.plist entries=' \
+  || die "$BIN_PATH has no Info.plist sealed into its signature; TCC would have no usage strings"
+
+# 0700 on the product root as well as bin/: SPEC §13 says local state is 0700, and
+# `mkdir -p` creates intermediates at the default umask (0755), not the leaf's mode.
 mkdir -p "$DEST_DIR"
+chmod 700 "$(dirname "$DEST_DIR")"
 chmod 700 "$DEST_DIR"
 
 PREVIOUS_CDHASH="$(codesign -dvvv "$DEST" 2>&1 | sed -n 's/^CDHash=//p' || true)"

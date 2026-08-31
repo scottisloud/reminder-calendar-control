@@ -51,18 +51,22 @@ public struct Log: Sendable {
 
     private let minimumLevel: Level
     private let subsystem: Logger
-    private let fileHandle: FileHandle?
+    /// Raw descriptor rather than a `FileHandle`: it is opened `O_APPEND`, which makes each
+    /// `write` atomically seek to the current end of file. A `FileHandle` plus a one-time
+    /// `seekToEnd()` gives every process a private, immediately-stale offset, so `rcc serve`
+    /// and a `launchd`-fired `rcc automations run` would overwrite each other's lines.
+    private let descriptor: Int32
 
     private init() {
         self.minimumLevel = Level(rawValue: ProcessInfo.processInfo.environment["RCC_LOG_LEVEL"] ?? "")
             ?? .info
         self.subsystem = Logger(subsystem: RCCPaths.bundleIdentifier, category: "rcc")
-        self.fileHandle = Self.openLogFile()
+        self.descriptor = Self.openLogFile()
     }
 
-    private static func openLogFile() -> FileHandle? {
-        // A logger that cannot open its file must not take the process down, and must
-        // not fall back to stdout. It degrades to unified logging + stderr.
+    /// Returns -1 when unavailable. A logger that cannot open its file must not take the
+    /// process down, and must never fall back to stdout.
+    private static func openLogFile() -> Int32 {
         let directory = RCCPaths.logDirectory
         do {
             try FileManager.default.createDirectory(
@@ -71,28 +75,17 @@ public struct Log: Sendable {
                 attributes: [.posixPermissions: 0o700]
             )
         } catch {
-            return nil
+            return -1
         }
 
-        let day = RCCTime.localDay()
-        let url = directory.appendingPathComponent("rcc-\(day).jsonl", isDirectory: false)
-        if FileManager.default.fileExists(atPath: url.path) {
-            // An existing file keeps whatever mode it was created with, which may predate a
-            // umask fix or have come from another tool. Logs carry redacted user content, so
-            // tighten it every time rather than only at creation (SPEC §13).
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600], ofItemAtPath: url.path
-            )
-        } else {
-            FileManager.default.createFile(
-                atPath: url.path,
-                contents: nil,
-                attributes: [.posixPermissions: 0o600]
-            )
-        }
-        guard let handle = try? FileHandle(forWritingTo: url) else { return nil }
-        _ = try? handle.seekToEnd()
-        return handle
+        let url = directory.appendingPathComponent("rcc-\(RCCTime.localDay()).jsonl", isDirectory: false)
+        let descriptor = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { return -1 }
+        // An existing file keeps whatever mode it was created with, which may predate a
+        // umask fix or have come from another tool. Logs carry redacted user content, so
+        // tighten it every time rather than only at creation (SPEC §13).
+        _ = fchmod(descriptor, 0o600)
+        return descriptor
     }
 
     public func event(
@@ -122,8 +115,8 @@ public struct Log: Sendable {
         else { return }
         text.append("\n")
 
-        if let fileHandle, let bytes = text.data(using: .utf8) {
-            try? fileHandle.write(contentsOf: bytes)
+        if descriptor >= 0 {
+            writeAll(text, to: descriptor)
         }
 
         switch level {
@@ -133,8 +126,26 @@ public struct Log: Sendable {
         case .error: subsystem.error("\(event, privacy: .public)")
         }
 
-        if fileHandle == nil {
+        if descriptor < 0 {
             FileHandle.standardError.write(Data(text.utf8))
+        }
+    }
+
+    /// One `write` per line where possible, retrying short writes and `EINTR`. `O_APPEND`
+    /// makes each call atomic with respect to other processes appending to the same file.
+    private func writeAll(_ text: String, to descriptor: Int32) {
+        var bytes = Array(text.utf8)
+        bytes.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var offset = 0
+            while offset < buffer.count {
+                let written = write(descriptor, base + offset, buffer.count - offset)
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    return
+                }
+                offset += written
+            }
         }
     }
 

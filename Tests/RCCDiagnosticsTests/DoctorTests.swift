@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 
+@testable import RCCBootstrap
+
 @testable import RCCCalendar
 @testable import RCCCore
 @testable import RCCDiagnostics
@@ -74,7 +76,7 @@ struct DoctorTests {
     /// process rather than the injected fake, so they are asserted for presence only.
     @Test("Platform checks are present regardless of authorization state")
     func includesPlatformChecks() async throws {
-        let report = await Doctor(repository: InMemoryCalendarRepository()).run()
+        let report = await Doctor(repository: InMemoryCalendarRepository(), disclaim: nil).run()
         for id in ["disclaim", "bundle_identity", "running_binary", "installed_binary",
                    "gatekeeper", "mcp_registration", "launch_agent", "state",
                    "dev_fixture", "keychain", "notifications"] {
@@ -84,17 +86,39 @@ struct DoctorTests {
 
     /// Under `swift test` the disclaim never runs — top-level `main.swift` code is not
     /// executed — so this must report "unknown", never a false "ok".
+    /// "We did not check" must never be reported as "we checked and it is fine".
     @Test("A disclaim that never ran is unknown, not ok")
     func disclaimNotRunIsUnknown() async throws {
-        let report = await Doctor(repository: InMemoryCalendarRepository()).run()
+        let report = await Doctor(repository: InMemoryCalendarRepository(), disclaim: nil).run()
         let disclaim = try check(report, "disclaim")
         #expect(disclaim.status == .unknown)
         #expect(disclaim.detail.contains("not run"))
+    }
+
+    @Test("An unhealthy disclaim is a hard failure with remediation")
+    func disclaimFailureIsReported() async throws {
+        let unhealthy = Disclaim.Result(
+            outcome: .notDisclaimed, generation: 1, responsiblePID: 999, pid: 1,
+            mechanismAvailable: true
+        )
+        let report = await Doctor(repository: InMemoryCalendarRepository(), disclaim: unhealthy).run()
+        let disclaim = try check(report, "disclaim")
+        #expect(disclaim.status == .fail)
+        #expect(disclaim.remediation?.isEmpty == false)
+        #expect(disclaim.facts["responsible_pid"] == "999")
     }
 }
 
 @Suite("Self-test")
 struct SelfTestTests {
+    /// `Disclaim.ensure()` never runs under `swift test` — top-level `main.swift` code is
+    /// not executed — so every test states the disclaim state it is exercising.
+    private func result(_ outcome: Disclaim.Outcome) -> Disclaim.Result {
+        Disclaim.Result(
+            outcome: outcome, generation: 1, responsiblePID: 1, pid: 1, mechanismAvailable: true
+        )
+    }
+
     private func makeStore() throws -> Store {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("rcc-selftest-\(UUID().uuidString)", isDirectory: true)
@@ -107,25 +131,55 @@ struct SelfTestTests {
         let repository = InMemoryCalendarRepository(
             scenario: .init(eventStatus: .fullAccess, reminderStatus: .fullAccess)
         )
-        let outcome = try await SelfTest(repository: repository, store: try makeStore())
-            .run(context: "unit-test")
+        let outcome = try await SelfTest(
+            repository: repository, store: try makeStore(), disclaim: result(.disclaimed)
+        ).run(context: "unit-test")
         #expect(outcome.roundTrips.count == 2)
         #expect(outcome.roundTrips.allSatisfy { $0.readBack && $0.deleted })
         #expect(outcome.context == "unit-test")
     }
 
-    /// The gate is "exactly one re-exec", so a run where the disclaim never happened must
-    /// not report a pass no matter how well the EventKit round trips went.
-    @Test("A failed disclaim fails the whole self-test")
-    func disclaimFailureFailsEverything() async throws {
+    /// SPEC §6.2's degradation path: when the disclaim is unhealthy, rcc is non-functional
+    /// for TCC-touching work. That has to hold for every entry point, not just `rcc setup`.
+    @Test("An unhealthy disclaim refuses to touch EventKit at all", arguments: [
+        Disclaim.Outcome.notDisclaimed, .mechanismUnavailable, .guardViolated, .spawnFailed,
+    ])
+    func failsClosedOnUnhealthyDisclaim(_ outcome: Disclaim.Outcome) async throws {
         let repository = InMemoryCalendarRepository(
             scenario: .init(eventStatus: .fullAccess, reminderStatus: .fullAccess)
         )
-        let outcome = try await SelfTest(repository: repository, store: try makeStore())
-            .run(context: "unit-test")
-        // `Disclaim.ensure()` is never called under `swift test`.
-        #expect(!outcome.disclaim.passed)
-        #expect(!outcome.passed)
+        let store = try makeStore()
+        await #expect(throws: RCCError.self) {
+            try await SelfTest(repository: repository, store: store, disclaim: result(outcome))
+                .run(context: "unit-test")
+        }
+    }
+
+    @Test("A disclaim that never ran also refuses")
+    func failsClosedWhenDisclaimNeverRan() async throws {
+        let repository = InMemoryCalendarRepository(
+            scenario: .init(eventStatus: .fullAccess, reminderStatus: .fullAccess)
+        )
+        let store = try makeStore()
+        await #expect(throws: RCCError.self) {
+            try await SelfTest(repository: repository, store: store, disclaim: nil)
+                .run(context: "unit-test")
+        }
+    }
+
+    /// A model-invokable caller may use an existing fixture but must never create one:
+    /// two permanent calendars appearing in Calendar.app is not something a tool annotated
+    /// `destructiveHint: false` should do on its own.
+    @Test("With provisioning disallowed and no fixture recorded, the run refuses")
+    func refusesToProvisionForUntrustedCallers() async throws {
+        let repository = InMemoryCalendarRepository(
+            scenario: .init(eventStatus: .fullAccess, reminderStatus: .fullAccess)
+        )
+        let store = try makeStore()
+        await #expect(throws: RCCError.self) {
+            try await SelfTest(repository: repository, store: store, disclaim: result(.disclaimed))
+                .run(context: "unit-test", allowProvisioning: false)
+        }
     }
 
     @Test("Exactly-one-re-exec requires generation 1 and self-responsibility")
@@ -151,7 +205,9 @@ struct SelfTestTests {
     func unauthorizedFails() async throws {
         let repository = InMemoryCalendarRepository(scenario: .init(promptOutcome: nil))
         await #expect(throws: (any Error).self) {
-            _ = try await SelfTest(repository: repository, store: try makeStore()).run(context: "unit-test")
+            try await SelfTest(
+                repository: repository, store: try makeStore(), disclaim: result(.disclaimed)
+            ).run(context: "unit-test")
         }
     }
 
@@ -160,8 +216,9 @@ struct SelfTestTests {
         let repository = InMemoryCalendarRepository(
             scenario: .init(eventStatus: .fullAccess, reminderStatus: .fullAccess)
         )
-        let outcome = try await SelfTest(repository: repository, store: try makeStore())
-            .run(context: "unit-test")
+        let outcome = try await SelfTest(
+            repository: repository, store: try makeStore(), disclaim: result(.disclaimed)
+        ).run(context: "unit-test")
         let object = outcome.jsonObject()
         #expect(JSONSerialization.isValidJSONObject(object))
         #expect(object["context"] as? String == "unit-test")

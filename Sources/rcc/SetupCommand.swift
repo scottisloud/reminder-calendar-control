@@ -203,7 +203,16 @@ struct Setup: AsyncParsableCommand {
             Output.line("  state: preserved at \(RCCPaths.supportRoot.path)")
             Output.line("  dev fixtures: left in place")
         case .purge:
-            try await removeDevFixtures()
+            let orphans = await removeDevFixtures()
+            guard orphans.isEmpty else {
+                // The fixture record is the only thing binding rcc to those calendars.
+                // Deleting the state now would orphan them permanently while reporting
+                // success, so state is preserved and the calendars are named.
+                Output.line("  state: PRESERVED — could not delete \(orphans.count) dev calendar(s):")
+                for orphan in orphans { Output.line("      \(orphan)") }
+                Output.line("  Delete them in Calendar.app or Reminders.app, then re-run with --purge-state.")
+                return
+            }
             try removeStateDirectory()
             Output.line("  state: deleted")
         }
@@ -233,20 +242,25 @@ struct Setup: AsyncParsableCommand {
         return answer == "delete" ? .purge : .keep
     }
 
-    private func removeDevFixtures() async throws {
-        guard FileManager.default.fileExists(atPath: RCCPaths.databaseFile.path) else { return }
-        let repository = EventKitRepository()
-        let store = try Store()
-        let fixtures = DevFixtureManager(repository: repository, store: store)
+    /// Returns a description of every fixture calendar that could not be removed.
+    private func removeDevFixtures() async -> [String] {
+        guard FileManager.default.fileExists(atPath: RCCPaths.databaseFile.path),
+              let store = try? Store() else { return [] }
+        let fixtures = DevFixtureManager(repository: EventKitRepository(), store: store)
+        var orphans: [String] = []
         for entityType in RCCEntityType.allCases {
+            let recorded = (try? fixtures.recorded(entityType)) ?? nil
             do {
                 try await fixtures.remove(entityType)
             } catch {
-                // A fixture we cannot delete — revoked access, or the user removed it
-                // already — must not block the rest of the uninstall.
-                Output.line("  dev \(entityType.rawValue) fixture: could not remove (\(error))")
+                // Revoked access, or the user deleted it already. Either way the rest of the
+                // uninstall proceeds, but the caller needs to know.
+                let name = recorded.map { "\"\($0.title)\" (\($0.calendarID))" } ?? entityType.rawValue
+                Output.line("  dev \(entityType.rawValue) fixture: could not remove — \(error)")
+                orphans.append(name)
             }
         }
+        return orphans
     }
 
     private func removeStateDirectory() throws {
@@ -260,18 +274,7 @@ struct Setup: AsyncParsableCommand {
 
     // MARK: - Preconditions
 
-    private func requireDisclaimed() throws {
-        guard let result = Disclaim.result else {
-            throw RCCError(.internalError, "The disclaim mechanism did not run.")
-        }
-        guard result.outcome.isHealthy else {
-            throw RCCError(
-                .disclaimUnavailable,
-                "rcc cannot establish its own TCC identity (\(result.outcome.rawValue)).",
-                remediation: result.outcome.remediation
-            )
-        }
-    }
+    private func requireDisclaimed() throws { try DisclaimGate.require(Disclaim.result) }
 
     /// macOS records the grant against the binary that asked for it. Granting from a build
     /// directory produces a grant that the installed copy — the one Claude Desktop and

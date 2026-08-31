@@ -29,7 +29,9 @@ readonly PROG="${0##*/}"
 log()  { printf '[%s] %s\n' "$PROG" "$*" >&2; }
 warn() { printf '[%s] WARNING: %s\n' "$PROG" "$*" >&2; }
 die()  { printf '[%s] ERROR: %s\n' "$PROG" "$*" >&2; exit 1; }
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
+# Print the comment block at the top of this file, stopping at the first non-comment line,
+# so `--help` can never leak code (it used to end with `set -euo pipefail`).
+usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
 
 BINARY=""
 IDENTIFIER=""
@@ -74,8 +76,11 @@ resolve_identity() {
   printf '%s' "$found"
 }
 
+# Called once. Running it twice — the second time with stderr discarded — meant the
+# multi-identity `die` lost its message *and* terminated the script from inside a discarded
+# subshell, so the operator saw nothing at all.
 IDENTITY=""
-if resolve_identity >/dev/null 2>&1; then IDENTITY="$(resolve_identity)"; fi
+if identity_output="$(resolve_identity)"; then IDENTITY="$identity_output"; fi
 
 ADHOC=0
 if [ -z "$IDENTITY" ] || [ "$IDENTITY" = "-" ]; then

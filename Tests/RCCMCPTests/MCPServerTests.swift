@@ -1,21 +1,37 @@
 import Foundation
 import Testing
 
+@testable import RCCBootstrap
+
 @testable import RCCCalendar
 @testable import RCCCore
 @testable import RCCMCP
 
 @Suite("MCP wire contract")
 struct MCPServerTests {
-    private func makeServer() throws -> MCPServer {
+    private func makeStore() throws -> Store {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("rcc-mcp-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return MCPServer(
-            repository: InMemoryCalendarRepository(
+        return try Store(url: directory.appendingPathComponent("state.sqlite3", isDirectory: false))
+    }
+
+    private var healthyDisclaim: Disclaim.Result {
+        Disclaim.Result(
+            outcome: .disclaimed, generation: 1, responsiblePID: 1, pid: 1, mechanismAvailable: true
+        )
+    }
+
+    private func makeServer(
+        repository: InMemoryCalendarRepository? = nil,
+        store: Store? = nil
+    ) throws -> MCPServer {
+        MCPServer(
+            repository: repository ?? InMemoryCalendarRepository(
                 scenario: .init(eventStatus: .fullAccess, reminderStatus: .fullAccess)
             ),
-            store: try Store(url: directory.appendingPathComponent("state.sqlite3", isDirectory: false))
+            store: try store ?? makeStore(),
+            disclaim: healthyDisclaim
         )
     }
 
@@ -160,7 +176,9 @@ struct MCPServerTests {
     @Test("A tool that fails still returns a result, not a protocol error")
     func toolFailureIsNotAProtocolError() async throws {
         let server = MCPServer(
-            repository: InMemoryCalendarRepository(scenario: .init(eventStatus: .denied))
+            repository: InMemoryCalendarRepository(scenario: .init(eventStatus: .denied)),
+            store: try makeStore(),
+            disclaim: healthyDisclaim
         )
         let response = try #require(try await send(
             #"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_system_status","arguments":{}}}"#,
@@ -191,9 +209,19 @@ struct MCPServerTests {
         #expect((response["error"] as? [String: Any])?["code"] as? Int == -32600)
     }
 
-    @Test("The self-test tool round-trips against the fake and reports pass")
+    @Test("The self-test tool round-trips an already-provisioned fixture")
     func selfTestToolPasses() async throws {
-        let server = try makeServer()
+        let repository = InMemoryCalendarRepository(
+            scenario: .init(eventStatus: .fullAccess, reminderStatus: .fullAccess)
+        )
+        let store = try makeStore()
+        // A human provisions the fixture; the model-facing tool only uses it.
+        let fixtures = DevFixtureManager(repository: repository, store: store)
+        for entityType in RCCEntityType.allCases {
+            _ = try await fixtures.provision(entityType)
+        }
+
+        let server = try makeServer(repository: repository, store: store)
         let response = try #require(try await send(
             #"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_platform_selftest","arguments":{}}}"#,
             to: server
@@ -204,6 +232,68 @@ struct MCPServerTests {
         #expect(trips.count == 2)
         #expect(trips.allSatisfy { $0["read_back"] as? Bool == true })
         #expect(trips.allSatisfy { $0["deleted"] as? Bool == true })
+    }
+
+    /// A model-invokable tool must not create two permanent calendars in the user's
+    /// Calendar.app, whatever its description says it requires.
+    @Test("The self-test tool refuses when no fixture has been provisioned")
+    func selfTestToolWillNotProvision() async throws {
+        let server = try makeServer()
+        let response = try #require(try await send(
+            #"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_platform_selftest","arguments":{}}}"#,
+            to: server
+        ))
+        let result = try #require(response["result"] as? [String: Any])
+        #expect(result["isError"] as? Bool == true)
+    }
+
+    /// SPEC §6.2: when the disclaim is unhealthy rcc is non-functional for TCC-touching
+    /// work — including when the caller is a model rather than a human.
+    @Test("An unhealthy disclaim makes the EventKit tool refuse, while diagnostics still answer")
+    func failsClosedOverMCP() async throws {
+        let unhealthy = Disclaim.Result(
+            outcome: .notDisclaimed, generation: 1, responsiblePID: 99, pid: 1, mechanismAvailable: true
+        )
+        let server = MCPServer(
+            repository: InMemoryCalendarRepository(
+                scenario: .init(eventStatus: .fullAccess, reminderStatus: .fullAccess)
+            ),
+            store: try makeStore(),
+            disclaim: unhealthy
+        )
+        let selfTest = try #require(try await send(
+            #"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"run_platform_selftest","arguments":{}}}"#,
+            to: server
+        ))
+        #expect((selfTest["result"] as? [String: Any])?["isError"] as? Bool == true)
+
+        // Diagnostics must keep working: reporting why rcc is broken is their whole job.
+        let status = try #require(try await send(
+            #"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"get_system_status","arguments":{}}}"#,
+            to: server
+        ))
+        #expect(status["result"] != nil)
+    }
+
+    @Test("A JSON-RPC batch is rejected as an invalid request, not as malformed JSON")
+    func rejectsBatch() async throws {
+        let server = try makeServer()
+        let response = try #require(try await send(
+            #"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#, to: server
+        ))
+        let error = try #require(response["error"] as? [String: Any])
+        #expect(error["code"] as? Int == -32600)
+        #expect((error["message"] as? String)?.contains("Batch") == true)
+    }
+
+    @Test("get_system_status also rejects unknown arguments")
+    func statusValidatesArguments() async throws {
+        let server = try makeServer()
+        let response = try #require(try await send(
+            #"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"get_system_status","arguments":{"x":1}}}"#,
+            to: server
+        ))
+        #expect((response["result"] as? [String: Any])?["isError"] as? Bool == true)
     }
 }
 

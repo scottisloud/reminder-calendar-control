@@ -226,3 +226,16 @@ struct SelfTestTests {
         #expect((object["round_trips"] as? [[String: Any]])?.count == 2)
     }
 }
+
+@Suite("Install shape reporting")
+struct InstallShapeDoctorTests {
+    @Test("A missing install is a hard failure naming both candidate paths")
+    func reportsMissingInstall() async throws {
+        let report = await Doctor(repository: InMemoryCalendarRepository(), disclaim: nil).run()
+        let check = try #require(report.checks.first { $0.id == "install_shape" })
+        #expect(check.status == .fail)
+        #expect(check.facts["bare_path"]?.hasSuffix("/bin/rcc") == true)
+        #expect(check.facts["bundle_path"]?.hasSuffix("/RCC.app/Contents/MacOS/rcc") == true)
+        #expect(check.remediation?.contains("--bundle") == true)
+    }
+}

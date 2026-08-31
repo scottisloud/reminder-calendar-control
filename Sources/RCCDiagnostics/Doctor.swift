@@ -34,6 +34,7 @@ public struct Doctor: Sendable {
         checks.append(disclaimCheck())
         checks.append(bundleIdentityCheck())
         checks.append(runningBinaryCheck())
+        checks.append(installShapeCheck())
         checks.append(installedBinaryCheck())
         checks.append(gatekeeperCheck())
         let signature = CodeSignature.current()
@@ -168,6 +169,58 @@ public struct Doctor: Sendable {
             remediation: signature.hasHardenedRuntime
                 ? nil
                 : "Hardened Runtime is not enabled, which notarization requires.",
+            facts: facts
+        )
+    }
+
+    /// Which install shape is present, and whether more than one is (SPEC §6.1).
+    func installShapeCheck() -> HealthReport.Check {
+        let shapes = RCCPaths.installedShapes
+        var facts: [String: String] = [
+            "bare_path": RCCPaths.bareBinary.path,
+            "bundle_path": RCCPaths.bundledBinary.path,
+            "present": shapes.map(\.rawValue).joined(separator: ",").isEmpty
+                ? "none" : shapes.map(\.rawValue).joined(separator: ","),
+        ]
+
+        guard let shape = shapes.first else {
+            return HealthReport.Check(
+                id: "install_shape",
+                title: "Install shape",
+                status: .fail,
+                detail: "neither bin/rcc nor RCC.app is installed",
+                remediation: "Run Scripts/install.sh (bare, the default) or Scripts/install.sh --bundle.",
+                facts: facts
+            )
+        }
+
+        if shape == .bundle {
+            let iconPath = RCCPaths.appBundle
+                .appendingPathComponent("Contents/Resources/AppIcon.icns", isDirectory: false).path
+            facts["icon"] = FileManager.default.fileExists(atPath: iconPath) ? "present" : "MISSING"
+        }
+
+        // Two installs means Claude Desktop and launchd can be pointed at different builds
+        // without anything looking wrong — the exact failure SPEC §6.1 exists to prevent.
+        guard shapes.count == 1 else {
+            return HealthReport.Check(
+                id: "install_shape",
+                title: "Install shape",
+                status: .warn,
+                detail: "both a bundle and a bare binary are installed",
+                remediation: "rcc resolves to the bundle, but the stale copy at "
+                    + "\(RCCPaths.bareBinary.path) can still be launched by anything that "
+                    + "remembers the old path. Remove whichever you are not using, then re-run "
+                    + "`rcc setup` so the LaunchAgent and Claude Desktop agree.",
+                facts: facts
+            )
+        }
+
+        return HealthReport.Check(
+            id: "install_shape",
+            title: "Install shape",
+            status: .ok,
+            detail: shape == .bundle ? "RCC.app (icon included)" : "bare binary",
             facts: facts
         )
     }

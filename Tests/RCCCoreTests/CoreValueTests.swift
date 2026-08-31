@@ -161,3 +161,50 @@ struct PathSandboxTests {
         }
     }
 }
+
+// `.serialized`: these create and remove files under the sandboxed support root.
+@Suite("Install shape", .serialized)
+struct InstallShapeTests {
+    /// SPEC §6.1 wants one authoritative binary. These paths are what `rcc doctor`, the
+    /// LaunchAgent, and the Claude Desktop entry all have to agree on.
+    @Test("Bare and bundle paths hang off the same product root")
+    func pathsShareProductRoot() {
+        let root = RCCPaths.supportRoot.path
+        #expect(RCCPaths.bareBinary.path == root + "/bin/rcc")
+        #expect(RCCPaths.appBundle.path == root + "/RCC.app")
+        #expect(RCCPaths.bundledBinary.path == root + "/RCC.app/Contents/MacOS/rcc")
+    }
+
+    @Test("With nothing installed, the bare path is the fallback")
+    func fallsBackToBare() {
+        // The test sandbox redirects supportRoot, so neither shape exists here.
+        #expect(RCCPaths.installedShapes.isEmpty)
+        #expect(RCCPaths.installedBinary == RCCPaths.bareBinary)
+    }
+
+    /// The bundle wins the tie-break, but the ambiguity is what `doctor` has to surface —
+    /// two installs means Claude Desktop and launchd can point at different builds.
+    @Test("Both shapes present resolves to the bundle and reports both")
+    func bundleWinsButBothAreReported() throws {
+        let manager = FileManager.default
+        try manager.createDirectory(
+            at: RCCPaths.binDirectory, withIntermediateDirectories: true
+        )
+        try manager.createDirectory(
+            at: RCCPaths.bundledBinary.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        defer {
+            try? manager.removeItem(at: RCCPaths.bareBinary)
+            try? manager.removeItem(at: RCCPaths.appBundle)
+        }
+
+        manager.createFile(atPath: RCCPaths.bareBinary.path, contents: Data("x".utf8))
+        #expect(RCCPaths.installedShapes == [.bare])
+        #expect(RCCPaths.installedBinary == RCCPaths.bareBinary)
+
+        manager.createFile(atPath: RCCPaths.bundledBinary.path, contents: Data("x".utf8))
+        #expect(RCCPaths.installedShapes == [.bundle, .bare])
+        #expect(RCCPaths.installedBinary == RCCPaths.bundledBinary)
+    }
+}

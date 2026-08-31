@@ -2,11 +2,17 @@
 #
 # install.sh — build and atomically install rcc at its one authoritative path.
 #
-# Usage: Scripts/install.sh [--skip-build]
+# Usage: Scripts/install.sh [--skip-build] [--bundle]
 #
-# Installs to ~/Library/Application Support/reminder-calendar-control/bin/rcc by writing a
-# temp file in the same directory and rename()ing over the previous binary, so the path is
-# never observed half-written (SPEC §6.1).
+# Default: installs the bare binary to
+# ~/Library/Application Support/reminder-calendar-control/bin/rcc by writing a temp file in
+# the same directory and rename()ing over the previous one, so the path is never observed
+# half-written (SPEC §6.1).
+#
+# --bundle: installs RCC.app to the same product root instead. The bundle carries the app
+# icon, which a bare Mach-O cannot — but replacing a directory is not a single rename, so
+# there is a brief window where the path does not exist rather than an atomic swap. That is
+# why bare remains the default.
 #
 # This does NOT run `rcc setup`. Setup must be run from the installed path, by a human, so
 # macOS records the Calendar/Reminders grant against the binary that everything else runs.
@@ -22,7 +28,63 @@ cd "$ROOT"
 DEST_DIR="$HOME/Library/Application Support/reminder-calendar-control/bin"
 DEST="$DEST_DIR/rcc"
 
-if [ "${1:-}" = "--skip-build" ]; then
+BUNDLE=0
+SKIP_BUILD=0
+for arg in "$@"; do
+  case "$arg" in
+    --bundle)     BUNDLE=1 ;;
+    --skip-build) SKIP_BUILD=1 ;;
+    *) die "unknown option: $arg" ;;
+  esac
+done
+
+if [ "$BUNDLE" -eq 1 ]; then
+  [ "$SKIP_BUILD" -eq 0 ] || die "--skip-build is not supported with --bundle"
+  APP_SRC="$("$ROOT/Scripts/make-app-bundle.sh" | tail -n 1)"
+  [ -d "$APP_SRC" ] || die "no bundle at $APP_SRC"
+
+  PRODUCT_ROOT="$HOME/Library/Application Support/reminder-calendar-control"
+  APP_DEST="$PRODUCT_ROOT/RCC.app"
+  mkdir -p "$PRODUCT_ROOT"
+  chmod 700 "$PRODUCT_ROOT"
+
+  PREVIOUS_CDHASH="$(codesign -dvvv "$APP_DEST" 2>&1 | sed -n 's/^CDHash=//p' || true)"
+
+  # Stage beside the destination so the final move is a rename within one filesystem. A
+  # directory cannot be renamed *over* a non-empty directory, so the old one is moved aside
+  # first: the path is briefly absent, which is worse than the bare install's atomic swap
+  # and is stated plainly rather than papered over.
+  STAGE="$PRODUCT_ROOT/.RCC.app.incoming.$$"
+  rm -rf "$STAGE"
+  /usr/bin/ditto "$APP_SRC" "$STAGE"
+  rm -rf "$PRODUCT_ROOT/.RCC.app.previous"
+  [ -d "$APP_DEST" ] && mv "$APP_DEST" "$PRODUCT_ROOT/.RCC.app.previous"
+  mv "$STAGE" "$APP_DEST"
+  rm -rf "$PRODUCT_ROOT/.RCC.app.previous"
+
+  NEW_CDHASH="$(codesign -dvvv "$APP_DEST" 2>&1 | sed -n 's/^CDHash=//p' || true)"
+  log "installed: $APP_DEST"
+  log "binary:    $APP_DEST/Contents/MacOS/rcc"
+  log "cdhash:    ${NEW_CDHASH:-unknown}"
+
+  if [ -e "$PRODUCT_ROOT/bin/rcc" ]; then
+    log "NOTE: a bare binary is still installed at $PRODUCT_ROOT/bin/rcc."
+    log "      rcc resolves to the bundle, but remove the bare copy to avoid a split install."
+  fi
+  if [ -n "$PREVIOUS_CDHASH" ] && [ "$PREVIOUS_CDHASH" != "$NEW_CDHASH" ]; then
+    printf '\nThe installed code hash changed (%s -> %s); the TCC grant is invalidated.\n' \
+      "$PREVIOUS_CDHASH" "$NEW_CDHASH" >&2
+  fi
+  cat >&2 <<BANNER
+
+Next:
+    "$APP_DEST/Contents/MacOS/rcc" setup --dev
+    "$APP_DEST/Contents/MacOS/rcc" doctor
+BANNER
+  exit 0
+fi
+
+if [ "$SKIP_BUILD" -eq 1 ]; then
   BIN_PATH="$(swift build -c release --show-bin-path)/rcc"
   [ -f "$BIN_PATH" ] || die "no release build at $BIN_PATH; drop --skip-build"
 else

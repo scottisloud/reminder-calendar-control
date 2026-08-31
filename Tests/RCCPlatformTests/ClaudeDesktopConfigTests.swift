@@ -101,6 +101,22 @@ struct ClaudeDesktopConfigTests {
         #expect(mode.intValue == 0o600)
     }
 
+    /// Regression: `replaceItemAt` carries over the *original* file's metadata, so setting
+    /// 0600 on the temp file is not enough when the existing config is looser. This file
+    /// holds other MCP servers' API keys in their `env` blocks.
+    @Test("An existing world-readable config is tightened, not left as it was")
+    func tightensExistingLoosePermissions() throws {
+        let url = try temporaryConfig(#"{"mcpServers":{}}"#)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path)
+
+        try ClaudeDesktopConfig.register(entry: entry, configURL: url)
+
+        let mode = try #require(
+            FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+        )
+        #expect(mode.intValue == 0o600)
+    }
+
     @Test("The first modification leaves a backup behind")
     func keepsBackup() throws {
         let url = try temporaryConfig(#"{"preferences":{}}"#)

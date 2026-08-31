@@ -33,8 +33,9 @@ public struct Doctor: Sendable {
         checks.append(runningBinaryCheck())
         checks.append(installedBinaryCheck())
         checks.append(gatekeeperCheck())
-        checks.append(await authorizationCheck(.event))
-        checks.append(await authorizationCheck(.reminder))
+        let signature = CodeSignature.current()
+        checks.append(await authorizationCheck(.event, signature: signature))
+        checks.append(await authorizationCheck(.reminder, signature: signature))
         checks.append(mcpRegistrationCheck())
         checks.append(launchAgentCheck())
         checks.append(stateCheck())
@@ -239,7 +240,10 @@ public struct Doctor: Sendable {
         )
     }
 
-    func authorizationCheck(_ entityType: RCCEntityType) async -> HealthReport.Check {
+    func authorizationCheck(
+        _ entityType: RCCEntityType,
+        signature: CodeSignature? = nil
+    ) async -> HealthReport.Check {
         let status = await repository.authorizationStatus(for: entityType)
         let facts = [
             "status": status.known.rawValue,
@@ -254,10 +258,21 @@ public struct Doctor: Sendable {
                 facts: facts
             )
         }
-        let remediation: String
+        var remediation: String
         switch status.known {
         case .notDetermined:
             remediation = "Run `rcc setup` from Terminal; it will trigger the macOS permission prompt."
+            // Measured on macOS 26.6.2: with the disclaim active and an ad-hoc signature,
+            // EventKit returns granted=false with a nil error and no dialog at all, while
+            // the same binary without the disclaim prompts and is granted. The likely
+            // cause is that tccd has no stable designated requirement to record a grant
+            // against. Say so here rather than letting the operator re-run setup forever.
+            if signature?.isAdHoc == true, Disclaim.result?.outcome.isHealthy == true {
+                remediation += "\n\nKnown issue for this build: rcc is ad-hoc signed, and a disclaimed "
+                    + "ad-hoc process appears unable to obtain a grant on macOS 26 — the request is "
+                    + "denied immediately with no dialog. A Developer ID signature is expected to fix "
+                    + "it. See docs/milestone-1.md §1.0."
+            }
         case .denied:
             remediation = "Grant access in System Settings › Privacy & Security › \(entityType.displayName), "
                 + "then re-run `rcc setup --verify`."

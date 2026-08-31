@@ -76,7 +76,14 @@ public struct Log: Sendable {
 
         let day = RCCTime.localDay()
         let url = directory.appendingPathComponent("rcc-\(day).jsonl", isDirectory: false)
-        if !FileManager.default.fileExists(atPath: url.path) {
+        if FileManager.default.fileExists(atPath: url.path) {
+            // An existing file keeps whatever mode it was created with, which may predate a
+            // umask fix or have come from another tool. Logs carry redacted user content, so
+            // tighten it every time rather than only at creation (SPEC §13).
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: url.path
+            )
+        } else {
             FileManager.default.createFile(
                 atPath: url.path,
                 contents: nil,

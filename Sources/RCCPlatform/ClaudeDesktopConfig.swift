@@ -179,6 +179,11 @@ public enum ClaudeDesktopConfig {
                 "Could not update Claude Desktop's config at \(url.path): \(error.localizedDescription)"
             )
         }
+        // `replaceItemAt` carries over the *original* file's metadata, so the 0600 set on the
+        // temp file above does not survive if the existing config was looser. Pin it after
+        // the fact: sibling `mcpServers` entries routinely hold API keys in `env`, and
+        // Claude Desktop itself keeps this file at 0600.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     static func resolve(_ path: String) -> String {

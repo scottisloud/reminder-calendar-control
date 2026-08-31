@@ -3,7 +3,9 @@ import Testing
 
 @testable import RCCCore
 
-@Suite("Store")
+// `.serialized` because one test manipulates the process-global umask; running it
+// alongside other suites leaked a permissive umask into unrelated file-permission tests.
+@Suite("Store", .serialized)
 struct StoreTests {
     /// Each test gets its own database in a temp directory; nothing here ever touches the
     /// real state path.
@@ -25,6 +27,7 @@ struct StoreTests {
 
     @Test("The database and its WAL sidecars are 0600 even under a permissive umask")
     func restrictsPermissions() throws {
+        // umask is process-global; this is why the suite is serialised.
         let previous = umask(0o000)
         defer { umask(previous) }
 

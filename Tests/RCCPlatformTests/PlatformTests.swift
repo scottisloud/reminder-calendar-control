@@ -53,6 +53,31 @@ struct LaunchAgentTests {
         #expect((try plist()["Label"] as? String) == RCCPaths.automationAgentLabel)
     }
 
+    /// Regression: launchd hard-refuses a group- or world-writable plist, and reports it as
+    /// the same generic "Input/output error" as everything else — so a mode that silently
+    /// came out as 0664 produces a baffling install failure.
+    @Test("The plist is written 0644 even over an existing looser file and a permissive umask")
+    func writesPlistWithExactMode() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("rcc-plist-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("agent.plist", isDirectory: false)
+
+        // Pre-existing file with a mode launchd would reject.
+        FileManager.default.createFile(
+            atPath: url.path, contents: Data("old".utf8), attributes: [.posixPermissions: 0o666]
+        )
+        try LaunchAgent.writeAtomically(
+            try LaunchAgent.plistData(binaryPath: "/opt/rcc"), to: url, mode: 0o644
+        )
+
+        let mode = try #require(
+            FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+        )
+        #expect(mode.intValue == 0o644)
+        #expect(mode.intValue & 0o022 == 0, "launchd refuses a group/world-writable plist")
+    }
+
     @Test("launchctl print output is parsed for exit status and pid")
     func parsesLaunchctlOutput() {
         let output = """

@@ -225,5 +225,10 @@ public enum LaunchAgent {
             try? FileManager.default.removeItem(at: temporary)
             throw RCCError(.install, "Could not write \(url.path): \(error.localizedDescription)")
         }
+        // `replaceItemAt` preserves the previous file's mode, so the mode requested above is
+        // not guaranteed to survive. This is not cosmetic: launchd refuses to bootstrap a
+        // group- or world-writable plist, and reports it as the same generic
+        // "Input/output error" as every other failure.
+        try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
     }
 }

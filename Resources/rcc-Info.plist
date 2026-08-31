@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.scottlougheed.reminder-calendar-control</string>
+	<key>CFBundleName</key>
+	<string>rcc</string>
+	<key>CFBundleExecutable</key>
+	<string>rcc</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>rcc reads and writes your Calendar events so Claude can answer questions about your schedule and make changes you ask for.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>rcc reads and writes your Reminders so Claude can answer questions about your tasks and make changes you ask for.</string>
+</dict>
+</plist>

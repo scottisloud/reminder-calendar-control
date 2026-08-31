@@ -134,3 +134,30 @@ struct HealthReportTests {
         #expect(text.contains("do this"))
     }
 }
+
+@Suite("Path sandboxing")
+struct PathSandboxTests {
+    /// Guards against a regression that actually happened: a test run created a real
+    /// `state.sqlite3` under the operator's Application Support directory, which then made
+    /// `rcc doctor` report an install that had never been set up.
+    @Test("Under swift test, every writable path is redirected away from the real home")
+    func writablePathsAreRedirected() {
+        #expect(RCCPaths.isTestSandboxed, "Bundle.main is not the xctest tool — detection broke")
+
+        let home = RCCPaths.home.path
+        for url in [
+            RCCPaths.supportRoot,
+            RCCPaths.databaseFile,
+            RCCPaths.logDirectory,
+            RCCPaths.launchAgentsDirectory,
+            RCCPaths.claudeDesktopConfig,
+            RCCPaths.installedBinary,
+            RCCPaths.automationAgentPlist,
+        ] {
+            #expect(
+                !url.path.hasPrefix(home + "/Library"),
+                "\(url.path) still points into the real home"
+            )
+        }
+    }
+}

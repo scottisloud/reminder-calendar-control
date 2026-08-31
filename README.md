@@ -57,7 +57,7 @@ anything.
 
 ```bash
 swift build            # debug
-swift test             # 109 tests, no EventKit or TCC involvement
+swift test             # 116 tests, no EventKit or TCC involvement
 ./Scripts/build-release.sh
 ./Scripts/m1-acceptance.sh
 ```

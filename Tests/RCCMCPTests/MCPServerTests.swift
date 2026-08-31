@@ -206,3 +206,74 @@ struct MCPServerTests {
         #expect(trips.allSatisfy { $0["deleted"] as? Bool == true })
     }
 }
+
+@Suite("Frame splitting")
+struct FrameSplitterTests {
+    private func text(_ frames: [Data]) -> [String] {
+        frames.map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    @Test("Several frames in one chunk all come back, in order")
+    func splitsMultipleFrames() {
+        var splitter = FrameSplitter()
+        #expect(text(splitter.append(Data("{\"a\":1}\n{\"b\":2}\n".utf8))) == ["{\"a\":1}", "{\"b\":2}"])
+        #expect(splitter.pendingByteCount == 0)
+    }
+
+    @Test("A frame split across chunks is reassembled")
+    func reassemblesAcrossChunks() {
+        var splitter = FrameSplitter()
+        #expect(splitter.append(Data("{\"a\"".utf8)).isEmpty)
+        #expect(splitter.append(Data(":1}".utf8)).isEmpty)
+        #expect(text(splitter.append(Data("\n".utf8))) == ["{\"a\":1}"])
+    }
+
+    /// The hazard this type exists for: a sliced `Data` keeps its parent's index base, so
+    /// index arithmetic that assumes zero-based storage reads the wrong bytes or traps.
+    /// Feeding one byte at a time maximises the number of re-slices.
+    @Test("Byte-at-a-time delivery survives repeated re-slicing")
+    func survivesByteAtATime() {
+        var splitter = FrameSplitter()
+        var frames: [Data] = []
+        for byte in Array("one\ntwo\nthree\n".utf8) {
+            frames.append(contentsOf: splitter.append(Data([byte])))
+        }
+        #expect(text(frames) == ["one", "two", "three"])
+        #expect(splitter.pendingByteCount == 0)
+    }
+
+    @Test("Blank lines are padding, not frames")
+    func skipsBlankLines() {
+        var splitter = FrameSplitter()
+        #expect(text(splitter.append(Data("\n\n{\"a\":1}\n\n".utf8))) == ["{\"a\":1}"])
+    }
+
+    @Test("A frame larger than one read is handled")
+    func handlesLargeFrame() {
+        var splitter = FrameSplitter()
+        let payload = String(repeating: "x", count: 200_000)
+        #expect(splitter.append(Data(payload.utf8)).isEmpty)
+        #expect(splitter.pendingByteCount == 200_000)
+        let frames = splitter.append(Data("\n".utf8))
+        #expect(frames.count == 1)
+        #expect(frames[0].count == 200_000)
+        #expect(splitter.pendingByteCount == 0)
+    }
+
+    @Test("A truncated trailing frame is retained, not silently emitted")
+    func retainsTruncatedFrame() {
+        var splitter = FrameSplitter()
+        #expect(splitter.append(Data("{\"a\":1}\n{\"incomp".utf8)).count == 1)
+        // At EOF a non-zero pending count is how a caller detects a truncated stream.
+        #expect(splitter.pendingByteCount == 8)
+    }
+
+    @Test("Non-UTF8 bytes do not break framing")
+    func handlesBinaryGarbage() {
+        var splitter = FrameSplitter()
+        let frames = splitter.append(Data([0xFF, 0xFE, 0x0A, 0x7B, 0x7D, 0x0A]))
+        #expect(frames.count == 2)
+        #expect(frames[0] == Data([0xFF, 0xFE]))
+        #expect(frames[1] == Data([0x7B, 0x7D]))
+    }
+}

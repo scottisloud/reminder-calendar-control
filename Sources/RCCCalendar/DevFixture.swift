@@ -58,7 +58,8 @@ public struct DevFixtureManager: Sendable {
         Log.shared.info("devfixture.created", [
             "entity": .safe(entityType.rawValue),
             "calendar": .safe(calendar.id),
-            "source": .safe(calendar.sourceTitle ?? "unknown"),
+            // The account title is the user's, not ours — redact it like any other content.
+            "source": .content(calendar.sourceTitle),
         ])
         return fixture
     }
@@ -121,15 +122,52 @@ public struct DevFixtureManager: Sendable {
 
     /// Create one item in the fixture, read it back, then delete it.
     ///
+    /// `allowProvisioning` is false for anything a model can invoke: creating two permanent
+    /// calendars in someone's Calendar.app is not what a tool documented as "requires
+    /// `rcc setup --dev`" and annotated `destructiveHint: false` should do on its own.
+    ///
     /// This is Milestone 1's actual acceptance evidence: it proves the TCC grant is real
     /// and *writable* from whichever launch context invoked it, not merely that
     /// `authorizationStatus` reads `fullAccess`. It cleans up after itself so it can run
     /// from Terminal, from Claude Desktop, and from the LaunchAgent in a single pass.
-    public func roundTrip(_ entityType: RCCEntityType, now: Date = Date()) async throws -> RoundTrip {
-        let fixture = try await provision(entityType)
+    public func roundTrip(
+        _ entityType: RCCEntityType,
+        now: Date = Date(),
+        allowProvisioning: Bool = true
+    ) async throws -> RoundTrip {
+        let fixture: Store.DevFixture
+        if allowProvisioning {
+            fixture = try await provision(entityType)
+        } else {
+            guard let recorded = try recorded(entityType),
+                  try await repository.calendar(withIdentifier: recorded.calendarID, entityType: entityType) != nil
+            else {
+                throw RCCError(
+                    .validation,
+                    "No \(entityType.rawValue) dev fixture exists, and this caller may not create one.",
+                    remediation: "Run `rcc setup --dev` from Terminal first."
+                )
+            }
+            fixture = recorded
+        }
         try assertOwned(fixture.calendarID, entityType: entityType)
 
         let title = "rcc selftest \(Self.shortToken())"
+        var createdIdentifier: String?
+        // Cleanup runs even if read-back throws: otherwise a transient EventKit failure
+        // between the write and the read leaves the test item behind forever.
+        defer {
+            if let leaked = createdIdentifier {
+                let repository = self.repository
+                Task.detached { [entityType] in
+                    switch entityType {
+                    case .event: try? await repository.deleteEvent(identifier: leaked)
+                    case .reminder: try? await repository.deleteReminder(identifier: leaked)
+                    }
+                }
+            }
+        }
+
         let identifier: String
         let readBack: Bool
 
@@ -148,6 +186,7 @@ public struct DevFixtureManager: Sendable {
                     notes: "Created by `rcc selftest`. Safe to delete."
                 )
             )
+            createdIdentifier = identifier
             let found = try await repository.events(
                 inCalendar: fixture.calendarID,
                 from: now,
@@ -163,6 +202,7 @@ public struct DevFixtureManager: Sendable {
                     notes: "Created by `rcc selftest`. Safe to delete."
                 )
             )
+            createdIdentifier = identifier
             let found = try await repository.reminders(inCalendar: fixture.calendarID)
             readBack = found.contains { $0.id == identifier }
         }
@@ -174,12 +214,14 @@ public struct DevFixtureManager: Sendable {
             case .reminder: try await repository.deleteReminder(identifier: identifier)
             }
             deleted = true
+            createdIdentifier = nil
         } catch {
             // Report the failed cleanup rather than masking a successful write behind it —
             // a leftover item in a fixture calendar is untidy, not dangerous.
             Log.shared.warn("devfixture.cleanup_failed", [
                 "entity": .safe(entityType.rawValue),
-                "error": .safe(String(describing: error)),
+                // An EventKit error string can embed the item's own title.
+                "error": .content(String(describing: error)),
             ])
         }
 

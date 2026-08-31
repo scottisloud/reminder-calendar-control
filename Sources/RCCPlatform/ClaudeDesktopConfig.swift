@@ -104,7 +104,8 @@ public enum ClaudeDesktopConfig {
     // MARK: - File I/O
 
     /// `nil` means "no config file yet", which is a normal first-run state.
-    static func readConfig(at url: URL) throws -> [String: Any]? {
+    static func readConfig(at configURL: URL) throws -> [String: Any]? {
+        let url = configURL.resolvingSymlinksInPath()
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let data: Data
         do {
@@ -131,7 +132,12 @@ public enum ClaudeDesktopConfig {
         return root
     }
 
-    static func writeConfig(_ root: [String: Any], to url: URL) throws {
+    static func writeConfig(_ root: [String: Any], to configURL: URL) throws {
+        // Symlinking the Claude config into a managed dotfiles repo is a common setup, and
+        // `replaceItemAt` refuses to operate on a symlink — it would fail with a confusing
+        // "file doesn't exist" after we had just read the file successfully. Resolve first
+        // so the atomic replace happens on the real file, in the real file's directory.
+        let url = configURL.resolvingSymlinksInPath()
         let directory = url.deletingLastPathComponent()
         guard FileManager.default.fileExists(atPath: directory.path) else {
             throw RCCError(
@@ -146,15 +152,19 @@ public enum ClaudeDesktopConfig {
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
 
-        // Back up whatever was there before the first modification of the day, so a bad
-        // merge is recoverable without a Time Machine trip.
+        // Back up whatever is there right now, so a bad merge is recoverable without a
+        // Time Machine trip. Refreshed on every write: a backup taken once and never updated
+        // stops representing the pre-change state the moment anything else edits the file,
+        // which is exactly when you would reach for it.
         if FileManager.default.fileExists(atPath: url.path) {
             let backup = directory.appendingPathComponent(
                 "claude_desktop_config.json.rcc-backup", isDirectory: false
             )
-            if !FileManager.default.fileExists(atPath: backup.path) {
-                try? FileManager.default.copyItem(at: url, to: backup)
-            }
+            try? FileManager.default.removeItem(at: backup)
+            try? FileManager.default.copyItem(at: url, to: backup)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: backup.path
+            )
         }
 
         let temporary = directory.appendingPathComponent(

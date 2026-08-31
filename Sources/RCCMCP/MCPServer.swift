@@ -1,4 +1,5 @@
 import Foundation
+import RCCBootstrap
 import RCCCalendar
 import RCCCore
 import RCCDiagnostics
@@ -31,12 +32,19 @@ public struct MCPServer: Sendable {
 
     private let repository: any CalendarRepository
     private let store: Store?
+    private let disclaim: Disclaim.Result?
 
-    /// `store` is injectable so tests never touch the real state database. `nil` means the
-    /// default path, which is what `rcc serve` uses.
-    public init(repository: any CalendarRepository, store: Store? = nil) {
+    /// `store` and `disclaim` are injectable so tests never touch the real state database
+    /// and never depend on process-global disclaim state. `nil` store means the default
+    /// path, which is what `rcc serve` uses.
+    public init(
+        repository: any CalendarRepository,
+        store: Store? = nil,
+        disclaim: Disclaim.Result? = Disclaim.result
+    ) {
         self.repository = repository
         self.store = store
+        self.disclaim = disclaim
     }
 
     /// Serve until stdin reaches EOF.
@@ -56,9 +64,21 @@ public struct MCPServer: Sendable {
     /// Separated from the I/O so the dispatch rules — especially "never reply to a
     /// notification" — are directly testable without a pipe.
     func response(for line: Data) async -> [String: Any]? {
-        guard let message = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+        guard let parsed = try? JSONSerialization.jsonObject(with: line) else {
             // A parse failure has no id to correlate against, so JSON-RPC requires null.
             return Self.errorResponse(id: NSNull(), code: -32700, message: "Parse error")
+        }
+        if parsed is [Any] {
+            // A top-level array is a JSON-RPC batch: valid JSON, so not -32700. MCP removed
+            // batching and Claude Desktop does not send it, but reporting it as a parse
+            // error would send a client hunting for malformed JSON that is not there.
+            return Self.errorResponse(
+                id: NSNull(), code: -32600,
+                message: "Batch requests are not supported; send one request per line."
+            )
+        }
+        guard let message = parsed as? [String: Any] else {
+            return Self.errorResponse(id: NSNull(), code: -32600, message: "Invalid Request")
         }
 
         let identifier = message["id"]
@@ -110,7 +130,15 @@ public struct MCPServer: Sendable {
 
         switch name {
         case Tools.getSystemStatus:
-            let report = await Doctor(repository: repository).run()
+            // Diagnostics are the one thing that must still work when the disclaim failed —
+            // reporting *why* rcc is non-functional is the whole point of this tool.
+            guard arguments.isEmpty else {
+                return .success(Self.toolResult(
+                    ["error": "This tool takes no arguments; received \(arguments.keys.sorted())"],
+                    isError: true
+                ))
+            }
+            let report = await Doctor(repository: repository, disclaim: disclaim).run()
             return .success(Self.toolResult(report.jsonObject(), isError: report.hasFailures))
 
         case Tools.runPlatformSelfTest:
@@ -121,7 +149,9 @@ public struct MCPServer: Sendable {
                 ))
             }
             do {
-                let outcome = try await SelfTest(repository: repository, store: store).run()
+                let outcome = try await SelfTest(
+                    repository: repository, store: store, disclaim: disclaim
+                ).run(allowProvisioning: false)
                 return .success(Self.toolResult(outcome.jsonObject(), isError: !outcome.passed))
             } catch {
                 // A domain failure travels as a successful result with `isError: true` so
@@ -167,14 +197,23 @@ public struct MCPServer: Sendable {
     /// as text for backwards compatibility, and in practice that text block is what most
     /// reliably reaches the model.
     static func toolResult(_ structured: [String: Any], isError: Bool) -> [String: Any] {
-        let text: String
-        if let data = try? JSONSerialization.data(
+        // If the payload cannot be encoded, substituting `{}` for the *text* mirror is not
+        // enough: embedding the same unencodable dictionary in `structuredContent` makes the
+        // whole envelope fail to serialise, and `send` drops it — leaving the request with
+        // no reply at all. Replace both, and say what happened.
+        guard let data = try? JSONSerialization.data(
             withJSONObject: structured,
             options: [.sortedKeys, .withoutEscapingSlashes]
-        ), let rendered = String(data: data, encoding: .utf8) {
-            text = rendered
-        } else {
-            text = "{}"
+        ), let text = String(data: data, encoding: .utf8) else {
+            Log.shared.error("mcp.unencodable_result")
+            let fallback: [String: Any] = [
+                "error": "internal: the tool produced a result that could not be encoded as JSON",
+            ]
+            return [
+                "content": [["type": "text", "text": #"{"error":"unencodable result"}"#]],
+                "structuredContent": fallback,
+                "isError": true,
+            ]
         }
         return [
             "content": [["type": "text", "text": text]],

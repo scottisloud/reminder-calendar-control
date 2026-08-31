@@ -36,6 +36,11 @@ public enum Disclaim {
         case notDisclaimed
         /// The private symbols are gone from this OS. No fallback exists by design.
         case mechanismUnavailable
+        /// The symbols resolved but rejected the request. Distinct from
+        /// `mechanismUnavailable`: "the OS removed this" and "the OS refused this call" call
+        /// for different investigations, and reporting the second as the first sends an
+        /// operator looking for the wrong thing.
+        case mechanismRejected
         /// `posix_spawn` itself failed.
         case spawnFailed
         /// Could not resolve our own executable path.
@@ -50,6 +55,11 @@ public enum Disclaim {
             switch self {
             case .disclaimed:
                 return nil
+            case .mechanismRejected:
+                return "responsibility_spawnattrs_setdisclaim is present on this system but rejected "
+                    + "the request. This is not the symbol having been removed; something about the "
+                    + "spawn attributes or the caller was refused. `rcc doctor --json` records the "
+                    + "raw outcome."
             case .notDisclaimed, .guardViolated:
                 return "TCC still attributes rcc's requests to the process that launched it, so a "
                     + "Calendar/Reminders prompt will never name rcc. This usually means the OS "
@@ -81,6 +91,18 @@ public enum Disclaim {
         /// Set when `posix_spawn` failed; carries its return value, which *is* the errno
         /// (`posix_spawn` returns it rather than setting the global).
         public let spawnErrno: Int32?
+
+        public init(
+            outcome: Outcome, generation: Int, responsiblePID: pid_t,
+            pid: pid_t, mechanismAvailable: Bool, spawnErrno: Int32? = nil
+        ) {
+            self.outcome = outcome
+            self.generation = generation
+            self.responsiblePID = responsiblePID
+            self.pid = pid
+            self.mechanismAvailable = mechanismAvailable
+            self.spawnErrno = spawnErrno
+        }
 
         public var isSelfResponsible: Bool { responsiblePID == pid }
     }
@@ -123,14 +145,7 @@ public enum Disclaim {
 
         // Second image (or a forged sentinel). Never re-exec again, whatever we find.
         let responsible = rcc_responsible_pid(pid)
-        let outcome: Outcome
-        if generation > 1 {
-            outcome = .guardViolated
-        } else if responsible == pid {
-            outcome = .disclaimed
-        } else {
-            outcome = .notDisclaimed
-        }
+        let outcome = classify(generation: generation, responsiblePID: responsible, pid: pid)
         return finish(Result(
             outcome: outcome, generation: generation, responsiblePID: responsible,
             pid: pid, mechanismAvailable: available, spawnErrno: nil
@@ -139,22 +154,14 @@ public enum Disclaim {
 
     // MARK: - Internals
 
-    /// Parse `"<pid>:<generation>"`, accepting it only when the pid is ours.
+    /// Read and consume the sentinel. Parsing lives in `parseSentinel` so the production
+    /// path and the tests exercise the same code rather than two copies that can drift.
     private static func readGeneration(for pid: pid_t) -> Int {
         let raw = ProcessInfo.processInfo.environment[generationEnvironmentKey]
         // Unset immediately so the sentinel never leaks into child processes, where it
         // would make a nested `rcc` skip its own disclaim.
         unsetenv(generationEnvironmentKey)
-
-        guard let raw else { return 0 }
-        let parts = raw.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2,
-              let sentinelPID = pid_t(parts[0]),
-              sentinelPID == pid,
-              let generation = Int(parts[1]),
-              generation >= 0
-        else { return 0 }
-        return generation
+        return parseSentinel(raw, pid: pid)
     }
 
     private static func reexec(pid: pid_t, nextGeneration: Int) -> Result {
@@ -182,11 +189,16 @@ public enum Disclaim {
                 pid: pid, mechanismAvailable: true, spawnErrno: nil
             ))
         }
-        guard rcc_spawnattrs_setdisclaim(&attributes, 1) == 0 else {
+        // The shim returns -1 only when the symbol did not resolve; any other nonzero value
+        // is the SPI's own rejection, which is a different problem.
+        let disclaimStatus = rcc_spawnattrs_setdisclaim(&attributes, 1)
+        guard disclaimStatus == 0 else {
+            let symbolMissing = disclaimStatus == -1
             return finish(Result(
-                outcome: .mechanismUnavailable, generation: 0,
+                outcome: symbolMissing ? .mechanismUnavailable : .mechanismRejected,
+                generation: 0,
                 responsiblePID: rcc_responsible_pid(pid), pid: pid,
-                mechanismAvailable: false, spawnErrno: nil
+                mechanismAvailable: !symbolMissing, spawnErrno: symbolMissing ? nil : disclaimStatus
             ))
         }
 
@@ -210,11 +222,16 @@ public enum Disclaim {
 
         let status = posix_spawn(nil, executablePath, nil, &attributes, argv, envp)
 
-        // Reaching this line at all means the spawn failed: on success the image is gone.
-        // `posix_spawn` returns the errno instead of setting it, so `perror` would lie.
+        // Reaching this line at all means the spawn failed: with `POSIX_SPAWN_SETEXEC` the
+        // image is replaced on success, so `posix_spawn` never returns. `posix_spawn` returns
+        // the errno instead of setting it, so `perror` would print garbage.
+        //
+        // A return of 0 would mean SETEXEC was silently dropped and a *second* process now
+        // shares our stdio — the worst possible outcome for an MCP server. Treat it as a
+        // failure rather than assuming it cannot happen.
         return finish(Result(
             outcome: .spawnFailed, generation: 0, responsiblePID: rcc_responsible_pid(pid),
-            pid: pid, mechanismAvailable: true, spawnErrno: status
+            pid: pid, mechanismAvailable: true, spawnErrno: status == 0 ? -1 : status
         ))
     }
 

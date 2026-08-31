@@ -172,9 +172,13 @@ What is implemented instead:
 3. The authoritative check is not the sentinel at all — it is
    `responsibility_get_pid_responsible_for_pid(getpid()) == getpid()`. That is what catches
    a forged sentinel *and* the case where a future OS keeps the symbol but makes it a no-op.
-4. Failure is closed. `mechanismUnavailable`, `notDisclaimed`, `spawnFailed`,
-   `pathUnresolved`, and `guardViolated` all block TCC-touching work and are reported by
-   `rcc doctor`. There is no fallback that runs undisclaimed.
+4. Failure is closed, at **every** entry point. `mechanismUnavailable`,
+   `mechanismRejected`, `notDisclaimed`, `spawnFailed`, `pathUnresolved`, and
+   `guardViolated` all block TCC-touching work through a single `DisclaimGate`, which
+   `rcc setup`, `rcc selftest`, and the MCP `run_platform_selftest` tool all pass through.
+   There is no fallback that runs undisclaimed. `rcc serve` deliberately still *starts* in
+   that state — a server that exits immediately gives Claude Desktop nothing to show —
+   but every EventKit-touching tool refuses, and `get_system_status` reports why.
 
 SPEC §6.2 also says open file descriptors "are inherited by construction; nothing needs
 separate handling for those". Two corrections, both verified:
@@ -223,20 +227,35 @@ asked for it, so granting from `.build/` grants it to a copy nothing else runs; 
 refuses to run from anywhere else unless you pass `--allow-any-path`.
 
 **As of this commit the harness does not pass**, because `rcc setup` cannot obtain the
-Calendar grant (§1.0). It runs to completion and reports which assertions failed; that
-output is the current honest state of the milestone, not a green tick.
+Calendar grant (§1.0). It runs to completion and reports exactly which assertions failed;
+that output is the current honest state of the milestone, not a green tick.
 
-The harness asserts, for each of Terminal, an MCP child process over stdio, and a launchd
-LaunchAgent:
+Per launch context — Terminal, an MCP child process over stdio, and a launchd LaunchAgent —
+it asserts exactly one `RCC_DISCLAIM event=reexec` line, `generation == 1`,
+`responsible_pid == pid`, and an event and a reminder written to the dev fixtures, read
+back, and deleted. It then checks `rcc serve`'s wire behaviour (three responses for four
+frames, since a `notifications/initialized` notification must never be answered; every
+stdout line parsing as JSON), `rcc doctor` reporting no failing checks, and SPEC §16's
+exit-code contract.
 
-* exactly one `RCC_DISCLAIM event=reexec` line, and `generation == 1`
-* `responsible_pid == pid`
-* an event and a reminder written to the dev fixtures, read back, and deleted
-* `rcc doctor` reporting no failing checks
+What currently passes, and what does not:
 
-It also asserts that `rcc serve` answers three frames for four inputs — a
-`notifications/initialized` notification must never be answered — and that stdout carries
-nothing but JSON.
+```
+  FAIL  terminal:     Not authorized for Calendar: notDetermined (raw 0)
+  PASS  terminal:     exactly one 'reexec' line on stderr
+  PASS  mcp:          3 responses for 4 frames (the notification was correctly not answered)
+  PASS  mcp:          every stdout line parses as JSON
+  FAIL  mcp:          No event dev fixture exists, and this caller may not create one
+  PASS  mcp:          exactly one 'reexec' line on stderr
+  PASS  launchagent:  bootstrapped com.scottlougheed.reminder-calendar-control.m1probe
+  FAIL  launchagent:  Not authorized for Calendar: notDetermined (raw 0)
+  PASS  launchagent:  exactly one 'reexec' line on stderr
+  FAIL  doctor:       authorization_event, authorization_reminder, mcp_registration, launch_agent
+  PASS  --version exits 0 / --help exits 0 / unknown flag exits 2 / unknown subcommand exits 2
+```
+
+Every failure traces to the single blocker in §1.0. The disclaim half of the criterion —
+*"exactly one re-exec observed in each context"* — **does** hold in all three contexts.
 
 ---
 
@@ -336,6 +355,29 @@ WAL sidecar would leak readable data even inside a `0700` directory. `Store` cal
 `umask(0o077)` around `sqlite3_open_v2`, with a test asserting 0600 on all three files even
 under a permissive umask.
 
+### 5.10a §6.1 — "setup … requests notification permission"
+Not done, deliberately. `UNUserNotificationCenter.current()` aborts the process — uncatchably
+— for an executable with no bundle identifier, and even with an embedded plist a bundle-less
+client's authorization stays `notDetermined` and `add()` fails. `rcc setup` reports the
+capability instead of requesting anything, and notifications go through `osascript`,
+attributed to Script Editor rather than to `rcc`. A signed helper `.app` is the real fix and
+is deferred with the rest of the bundling question. Notification delivery is advisory in any
+case: SPEC §8.3 is explicit that it never gates whether an action was staged.
+
+### 5.10b §7.1 — `rcc setup --rotate-key` is absent
+`--enable-tier1` exists and fails with an explicit "not implemented until Milestone 7" usage
+error. Its sibling `--rotate-key` from the same line does not exist at all, so it fails as an
+unrecognised flag. Both belong to Tier 1 and land in Milestone 7. Also absent, and also
+Milestone 6/7 scope: `rcc automations {add,list,remove,edit,review,approve,reject,log}`, and
+SPEC §16's backup/export offer during uninstall.
+
+### 5.10c §7.4 — `reset()` is not yet wired to `EKEventStoreChanged`
+`CalendarRepository.reset()` exists and is called after an authorization change, but nothing
+observes `.EKEventStoreChanged` yet, so a long-lived `rcc serve` holds one `EKEventStore`
+for a whole Claude Desktop session. Harmless for Milestone 1, whose only reads are its own
+just-written test items; it becomes load-bearing in Milestone 3, along with the run-loop
+plumbing §5.7 describes.
+
 ### 5.11 §9.4 / §10 — the cursor's "store-generation marker"
 Unverified, and probably unavailable. No public EventKit API exposes a monotonic store
 generation; the only signal is the `EKEventStoreChanged` notification, which is a bare edge
@@ -399,3 +441,14 @@ fewer third-party binaries inside a notarized artifact is strictly better.
 Adopting it later is cheap: its `StdioTransport` takes an injectable output file descriptor,
 which is exactly the quarantined descriptor `ProtocolIO` already owns. The seam is one
 dispatch function and one transport.
+
+---
+
+## 8. Known gaps in the test story
+
+`InMemoryCalendarRepository` is necessarily more permissive than the real adapter: the
+guards that exist only in `EventKitRepository` — the exact `allowedEntityTypes` equality
+before deleting a calendar, the `EKSource` fallback chain, EventKit's own error domain — are
+by definition not exercised by tests that run against the fake. They are covered only by the
+acceptance matrix, which is the one thing currently blocked. Worth remembering before
+treating a green `swift test` as coverage of the EventKit layer.

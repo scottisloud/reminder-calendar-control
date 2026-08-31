@@ -40,7 +40,13 @@ public actor EventKitRepository: CalendarRepository {
             // A thrown error here is not the same as "the user said no"; report the
             // resulting status and let the caller decide, but keep the native error.
             let after = Self.map(EKEventStore.authorizationStatus(for: entityType.ekEntityType))
-            if after.grantsFullAccess { return after }
+            if after.grantsFullAccess {
+                // Same reason as the success path: the store was built while authorization
+                // was undetermined and must not be reused. Returning early here without the
+                // reset was a real hole.
+                await reset()
+                return after
+            }
             throw CalendarRepositoryError.native("requesting \(entityType.displayName) access", underlying: error as NSError)
         }
 
@@ -229,12 +235,17 @@ public actor EventKitRepository: CalendarRepository {
         try requireFullAccess(entityType)
         let all = store.sources
 
-        if let local = all.first(where: { $0.sourceType == .local && !$0.calendars(for: entityType.ekEntityType).isEmpty }) {
+        // A Local source that already holds calendars of this entity type is the ideal:
+        // it demonstrably accepts them, and it never syncs anywhere.
+        if let local = all.first(where: {
+            $0.sourceType == .local && !$0.calendars(for: entityType.ekEntityType).isEmpty
+        }) {
             return Self.summarize(source: local)
         }
-        if let local = all.first(where: { $0.sourceType == .local }) {
-            return Self.summarize(source: local)
-        }
+        // Then whatever EventKit itself would use, which is known-good for this entity type.
+        // Deliberately ahead of "any Local source": on an iCloud-only Mac a Local source can
+        // exist for events but reject reminders, and preferring it blindly would shadow a
+        // working fallback with one that fails at save time.
         let defaultCalendar = entityType == .event
             ? store.defaultCalendarForNewEvents
             : store.defaultCalendarForNewReminders()
@@ -243,6 +254,11 @@ public actor EventKitRepository: CalendarRepository {
         }
         if let usable = all.first(where: { !$0.calendars(for: entityType.ekEntityType).isEmpty }) {
             return Self.summarize(source: usable)
+        }
+        // Last resort: an empty Local source. It may reject the save, but a clear EventKit
+        // error beats "no source found".
+        if let local = all.first(where: { $0.sourceType == .local }) {
+            return Self.summarize(source: local)
         }
         throw CalendarRepositoryError.notFound(
             "no EventKit source on this Mac accepts a new \(entityType.rawValue) calendar"

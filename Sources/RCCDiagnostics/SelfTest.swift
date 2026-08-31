@@ -16,11 +16,18 @@ import RCCCore
 public struct SelfTest: Sendable {
     private let repository: any CalendarRepository
     private let injectedStore: Store?
+    private let disclaim: Disclaim.Result?
 
-    /// `store` is injectable so tests never touch the real state database.
-    public init(repository: any CalendarRepository, store: Store? = nil) {
+    /// `store` and `disclaim` are injectable so tests never touch the real state database
+    /// and never depend on process-global disclaim state.
+    public init(
+        repository: any CalendarRepository,
+        store: Store? = nil,
+        disclaim: Disclaim.Result? = Disclaim.result
+    ) {
         self.repository = repository
         self.injectedStore = store
+        self.disclaim = disclaim
     }
 
     public struct Outcome: Sendable {
@@ -100,9 +107,17 @@ public struct SelfTest: Sendable {
 
     /// Run the probe. `context` records which launch context invoked it, so the acceptance
     /// harness can diff three runs side by side.
-    public func run(context: String = SelfTest.detectContext()) async throws -> Outcome {
-        let result = Disclaim.result
-        let disclaim = DisclaimSummary(
+    /// `allowProvisioning` is false when a model can reach this: `run_platform_selftest`
+    /// must operate on a fixture a human already created, never mint one.
+    public func run(
+        context: String = SelfTest.detectContext(),
+        allowProvisioning: Bool = true
+    ) async throws -> Outcome {
+        // Fail closed before touching EventKit, whichever entry point got us here.
+        try DisclaimGate.require(disclaim)
+
+        let result = disclaim
+        let summary = DisclaimSummary(
             outcome: result?.outcome.rawValue ?? "not_run",
             generation: result?.generation ?? -1,
             pid: result?.pid ?? getpid(),
@@ -119,12 +134,12 @@ public struct SelfTest: Sendable {
         let fixtures = DevFixtureManager(repository: repository, store: store)
         var roundTrips: [DevFixtureManager.RoundTrip] = []
         for entityType in RCCEntityType.allCases {
-            roundTrips.append(try await fixtures.roundTrip(entityType))
+            roundTrips.append(try await fixtures.roundTrip(entityType, allowProvisioning: allowProvisioning))
         }
 
         let outcome = Outcome(
             context: context,
-            disclaim: disclaim,
+            disclaim: summary,
             roundTrips: roundTrips,
             authorization: authorization
         )

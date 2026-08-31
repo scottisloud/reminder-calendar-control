@@ -30,8 +30,18 @@ info() { printf '        %s\n' "$*"; }
 FAILURES=0
 RCC="$HOME/Library/Application Support/reminder-calendar-control/bin/rcc"
 RESULTS_DIR="${TMPDIR:-/tmp}/rcc-m1-acceptance.$$"
-[ "${1:-}" = "--results-dir" ] && { RESULTS_DIR="$2"; shift 2; }
-mkdir -p "$RESULTS_DIR"
+if [ "${1:-}" = "--results-dir" ]; then
+  [ $# -ge 2 ] || { printf '[%s] ERROR: --results-dir needs a value\n' "$PROG" >&2; exit 2; }
+  RESULTS_DIR="$2"
+  shift 2
+fi
+# Absolute: context 3 runs under launchd, whose cwd is `/`, so a relative path would put the
+# LaunchAgent's output somewhere the harness never looks.
+mkdir -p "$RESULTS_DIR" || { printf '[%s] ERROR: cannot create %s\n' "$PROG" "$RESULTS_DIR" >&2; exit 2; }
+RESULTS_DIR="$(cd "$RESULTS_DIR" && pwd -P)"
+# Clear prior artifacts: the launchd wait loop below breaks as soon as a result file is
+# non-empty, so a reused directory would make it assert against the PREVIOUS run.
+rm -f "$RESULTS_DIR"/*.json "$RESULTS_DIR"/*.log "$RESULTS_DIR"/*.stdout "$RESULTS_DIR"/*.stderr 2>/dev/null || true
 
 if [ ! -x "$RCC" ]; then
   printf '[%s] ERROR: no installed binary at %s\n' "$PROG" "$RCC" >&2
@@ -59,6 +69,16 @@ assert_result() {
     fail "$context: no result written to $file"
     return
   fi
+  # When the run failed before it could measure anything, the payload carries an `error`
+  # instead of the full result. Report that first: "generation is -1" is true but useless
+  # next to "Calendar access was not granted".
+  local why
+  why="$(/usr/bin/plutil -extract error raw -o - "$file" 2>/dev/null)" || why=""
+  if [ -n "$why" ]; then
+    fail "$context: $why"
+    return
+  fi
+
   local passed disclaim gen pid responsible trips
   passed="$(/usr/bin/plutil -extract passed raw -o - "$file" 2>/dev/null || echo false)"
   disclaim="$(/usr/bin/plutil -extract disclaim.outcome raw -o - "$file" 2>/dev/null || echo '?')"
@@ -93,7 +113,10 @@ assert_result() {
 assert_single_reexec() {
   local context="$1" stderr_file="$2"
   local count
-  count="$(grep -c 'RCC_DISCLAIM event=reexec' "$stderr_file" 2>/dev/null || echo 0)"
+  # `grep -c` prints 0 *and* exits 1 when there are no matches, so a `|| echo 0` fallback
+  # would make $count the two-line string "0\n0". Suppress the exit status instead.
+  count="$(grep -c 'RCC_DISCLAIM event=reexec' "$stderr_file" 2>/dev/null)" || true
+  [ -n "$count" ] || count=0
   [ "$count" = "1" ] \
     && pass "$context: exactly one 'reexec' line on stderr" \
     || fail "$context: $count 'reexec' lines on stderr, expected 1"
@@ -142,9 +165,23 @@ RESPONSES="$(grep -c . "$RESULTS_DIR/mcp.stdout" 2>/dev/null || echo 0)"
 [ "$RESPONSES" = "3" ] \
   && pass "mcp: 3 responses for 4 frames (the notification was correctly not answered)" \
   || fail "mcp: $RESPONSES responses, expected 3"
-grep -q '^{' "$RESULTS_DIR/mcp.stdout" \
-  && pass "mcp: stdout carries only JSON frames" \
-  || fail "mcp: stdout is not pure JSON — something leaked past the quarantine"
+if /usr/bin/python3 -c '
+import json, sys
+for n, line in enumerate(open(sys.argv[1]), 1):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        json.loads(line)
+    except Exception as exc:
+        print(f"        line {n} is not JSON: {line[:80]!r} ({exc})")
+        sys.exit(1)
+sys.exit(0)
+' "$RESULTS_DIR/mcp.stdout"; then
+  pass "mcp: every stdout line parses as JSON"
+else
+  fail "mcp: stdout is not pure JSON — something leaked past the quarantine"
+fi
 assert_result mcp "$RESULTS_DIR/mcp.json"
 assert_single_reexec mcp "$RESULTS_DIR/mcp.stderr"
 
@@ -219,6 +256,23 @@ info "overall: $OVERALL (exit $DOCTOR_EXIT)"
 import json,sys
 r=json.load(open(sys.argv[1]))
 print(", ".join(c["id"] for c in r["checks"] if c["status"]=="fail"))' "$RESULTS_DIR/doctor.json" 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
+# Exit codes (SPEC §16)
+# ---------------------------------------------------------------------------
+log 'Exit-code contract'
+check_exit() {
+  local label="$1" expected="$2"; shift 2
+  "$@" >/dev/null 2>&1
+  local actual=$?
+  [ "$actual" = "$expected" ] \
+    && pass "$label exits $expected" \
+    || fail "$label exits $actual, expected $expected"
+}
+check_exit "--version"      0 "$RCC" --version
+check_exit "--help"         0 "$RCC" --help
+check_exit "an unknown flag" 2 "$RCC" --no-such-flag
+check_exit "an unknown subcommand" 2 "$RCC" no-such-subcommand
 
 # ---------------------------------------------------------------------------
 log 'Summary'

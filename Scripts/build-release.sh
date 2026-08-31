@@ -15,6 +15,9 @@ die() { printf '[%s] ERROR: %s\n' "$PROG" "$*" >&2; exit 1; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Expanded below as ${NOTARIZE_ARGS[@]+"${NOTARIZE_ARGS[@]}"}: on bash 3.2 — the /bin/bash
+# every stock Mac still ships — "${empty_array[@]}" under `set -u` is a fatal
+# "unbound variable", so the +alternate form is required, not stylistic.
 NOTARIZE_ARGS=()
 [ "${1:-}" = "--notarize" ] && NOTARIZE_ARGS=(--notarize)
 
@@ -22,8 +25,13 @@ NOTARIZE_ARGS=()
 VERSION="$(sed -n 's/^ *public static let version = "\(.*\)"$/\1/p' Sources/RCCCore/BuildInfo.swift)"
 [ -n "$VERSION" ] || die "could not read the version from Sources/RCCCore/BuildInfo.swift"
 GIT_REVISION="$(git rev-parse --short HEAD 2>/dev/null || echo '')"
-if [ -n "$GIT_REVISION" ] && ! git diff --quiet HEAD 2>/dev/null; then
-  GIT_REVISION="${GIT_REVISION}-dirty"
+# `git diff --quiet HEAD` only sees tracked modifications, but SwiftPM globs the target
+# directories and compiles untracked .swift files too — so an untracked source file would
+# otherwise be attributed to a clean revision.
+if [ -n "$GIT_REVISION" ]; then
+  if ! git diff --quiet HEAD 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard Sources Package.swift Resources 2>/dev/null)" ]; then
+    GIT_REVISION="${GIT_REVISION}-dirty"
+  fi
 fi
 log "version $VERSION${GIT_REVISION:+ +$GIT_REVISION}"
 
@@ -71,7 +79,7 @@ EMBEDDED_VERSION="$(printf '%s\n' "$EMBEDDED" | plutil -extract CFBundleShortVer
 [ "$EMBEDDED_VERSION" = "$VERSION" ] \
   || die "embedded CFBundleShortVersionString is $EMBEDDED_VERSION but the source says $VERSION (stale relink?)"
 
-"$ROOT/Scripts/sign.sh" --allow-adhoc "${NOTARIZE_ARGS[@]}" "$BIN_PATH"
+"$ROOT/Scripts/sign.sh" --allow-adhoc ${NOTARIZE_ARGS[@]+"${NOTARIZE_ARGS[@]}"} "$BIN_PATH"
 
 log "artifact: $BIN_PATH"
 printf '%s\n' "$BIN_PATH"

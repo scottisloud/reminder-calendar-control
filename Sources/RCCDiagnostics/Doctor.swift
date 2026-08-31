@@ -15,15 +15,18 @@ public struct Doctor: Sendable {
     private let repository: any CalendarRepository
     private let bundle: Bundle
     private let installedBinary: URL
+    private let disclaim: Disclaim.Result?
 
     public init(
         repository: any CalendarRepository,
         bundle: Bundle = .main,
-        installedBinary: URL = RCCPaths.installedBinary
+        installedBinary: URL = RCCPaths.installedBinary,
+        disclaim: Disclaim.Result? = Disclaim.result
     ) {
         self.repository = repository
         self.bundle = bundle
         self.installedBinary = installedBinary
+        self.disclaim = disclaim
     }
 
     public func run(now: Date = Date()) async -> HealthReport {
@@ -49,7 +52,7 @@ public struct Doctor: Sendable {
 
     /// The single point of failure the whole permission story rests on (SPEC §6.2).
     func disclaimCheck() -> HealthReport.Check {
-        guard let result = Disclaim.result else {
+        guard let result = disclaim else {
             return HealthReport.Check(
                 id: "disclaim",
                 title: "TCC self-disclaim",
@@ -267,7 +270,7 @@ public struct Doctor: Sendable {
             // the same binary without the disclaim prompts and is granted. The likely
             // cause is that tccd has no stable designated requirement to record a grant
             // against. Say so here rather than letting the operator re-run setup forever.
-            if signature?.isAdHoc == true, Disclaim.result?.outcome.isHealthy == true {
+            if signature?.isAdHoc == true, disclaim?.outcome.isHealthy == true {
                 remediation += "\n\nKnown issue for this build: rcc is ad-hoc signed, and a disclaimed "
                     + "ad-hoc process appears unable to obtain a grant on macOS 26 — the request is "
                     + "denied immediately with no dialog. A Developer ID signature is expected to fix "

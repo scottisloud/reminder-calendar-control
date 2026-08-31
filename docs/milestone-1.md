@@ -17,8 +17,64 @@ toolchain, Swift 6.2.3, SDK 26.2.
 
 ## 1. The blocker, stated plainly
 
-**This machine has no code-signing identity**, so the acceptance criterion as written
-cannot be completed here:
+Two blockers, both traced back to the same missing thing. The second was found by running
+the acceptance flow on the real machine, and it invalidates a decision SPEC §4 lists as
+already locked.
+
+### 1.0 The self-disclaim mechanism prevents the TCC grant it exists to enable
+
+**This is the headline finding, and it is reproducible.** With the disclaim active, EventKit
+returns `granted = false` with a `nil` error, *instantly and with no dialog*. With the
+disclaim skipped, the identical binary run from the identical Terminal prompts normally and
+is granted.
+
+Two runs, same Terminal window, seconds apart, two freshly built binaries with distinct
+bundle identifiers so both started at `notDetermined`:
+
+```
+A: bare executable, DISCLAIMED
+   pid=83318 responsible=83318 bundleID=com.scottlougheed.rcc-probe-bareA disclaimed=true
+   before: event=0 reminder=0
+   completion fired=true granted=false error=nil          <- no dialog ever appeared
+   after:  event=0 reminder=0
+
+B: bare executable, NOT DISCLAIMED
+   pid=83395 responsible=79759 bundleID=com.scottlougheed.rcc-probe-bareB disclaimed=false
+   before: event=0 reminder=0
+   completion fired=true granted=true error=nil           <- dialog appeared, Allow clicked
+   after:  event=3 reminder=0                             <- 3 = fullAccess
+```
+
+The same `granted=false, error=nil` result was reproduced for `rcc` itself and for
+standalone probes across **three** launch contexts — a shell spawned by Claude Code, a
+`launchctl`-kickstarted LaunchAgent, and a real Terminal window — and for both a bare
+Mach-O and a headless `.app` bundle. Two `open`-launched variants did briefly succeed, and
+two others failed with `EKCADErrorDomain Code=1015 "XPC error communicating with
+calaccessd"`; that inconsistency is itself part of the picture.
+
+**Best explanation, strongly supported but not proven:** tccd will not record a grant
+against a responsible process whose designated requirement is a bare `cdhash`. Disclaiming
+makes `rcc` its own responsible process; ad-hoc signing gives it a cdhash-only requirement;
+so there is nothing durable for tccd to key a grant to, and it denies immediately rather
+than showing a dialog nobody could honour. Not disclaiming hands responsibility to
+Terminal.app — Developer-ID-signed, stable identity — and everything works. This also
+explains the intermittent `calaccessd` XPC failures, and it is consistent with the prior
+art in SPEC §5 all being signed and notarized.
+
+Proving it requires a Developer ID certificate, which is the same thing §1.1 is blocked on.
+**Until one exists, both halves of Milestone 1's acceptance criterion are gated on the same
+purchase.** Nothing else in the implementation is blocked.
+
+If the explanation turns out to be wrong — if a Developer-ID-signed `rcc` still cannot get a
+grant while disclaimed — then SPEC §4's locked "Language/runtime: native Swift, headless
+CLI" plus §6.2's disclaim are incompatible on macOS 26, and the packaging decision in §6.1
+has to be reopened. That is worth knowing before Milestone 2 rather than after Milestone 5.
+
+### 1.1 No code-signing identity, so no notarized artifact
+
+
+**This machine has no code-signing identity**, so the artifact the acceptance criterion
+names cannot be built here:
 
 ```
 $ security find-identity -v -p codesigning
@@ -36,13 +92,18 @@ $ security find-identity -v -p codesigning
 
 So Milestone 1 is split:
 
-* **M1a — delivered here.** Everything except the certificate: the disclaim mechanism and
-  its guard, the install topology, `rcc doctor`, the dev fixtures, the MCP server, and the
-  full three-context acceptance matrix, against an **ad-hoc-signed, Hardened-Runtime**
-  artifact at the authoritative install path.
-* **M1b — outstanding, gated on an Apple Developer ID.** Re-run the identical matrix
-  against a Developer-ID-signed, notarized artifact. `Scripts/sign.sh --notarize` is
-  written and ready; it refuses to notarize an ad-hoc signature rather than pretending.
+* **M1a — delivered here.** Everything a certificate is not required for: the disclaim
+  mechanism and its guard, the install topology, `rcc doctor`, the dev fixtures, the
+  EventKit adapter, the MCP server, and the acceptance harness itself, all against an
+  **ad-hoc-signed, Hardened-Runtime** artifact at the authoritative install path.
+* **M1b — outstanding, gated on an Apple Developer ID.** Obtain the grant, then run the
+  three-context acceptance matrix against a Developer-ID-signed, notarized artifact.
+  `Scripts/sign.sh --notarize` is written and ready; it refuses to notarize an ad-hoc
+  signature rather than pretending.
+
+**The acceptance matrix has been written but not passed**, because §1.0 blocks the grant
+it depends on. `Scripts/m1-acceptance.sh` runs end to end and reports the failure honestly;
+it has not been given a green run and this document does not claim one.
 
 **M1b is a prerequisite for shipping, not for starting Milestone 2.** The permission story
 should not be called proven until it passes.
@@ -161,6 +222,10 @@ discriminates nothing.
 asked for it, so granting from `.build/` grants it to a copy nothing else runs; `rcc setup`
 refuses to run from anywhere else unless you pass `--allow-any-path`.
 
+**As of this commit the harness does not pass**, because `rcc setup` cannot obtain the
+Calendar grant (§1.0). It runs to completion and reports which assertions failed; that
+output is the current honest state of the milestone, not a green tick.
+
 The harness asserts, for each of Terminal, an MCP child process over stdio, and a launchd
 LaunchAgent:
 
@@ -180,11 +245,21 @@ nothing but JSON.
 Each of these is verified on this machine. They are recorded here rather than edited into
 SPEC.md, so the spec's own revision history stays the user's to write.
 
+### 5.0 §6.2 / §4 — the disclaim mechanism currently blocks the grant
+See §1.0. SPEC §4 lists the disclaim as load-bearing and §6.2 builds the whole permission
+story on it, but as measured here it is the *reason* the grant fails: disclaimed →
+`granted=false` with no dialog; not disclaimed → prompt and grant. The most likely cause is
+that an ad-hoc responsible process has no stable designated requirement for tccd to key a
+grant to, which would make this the same blocker as §5.1 — but that is an inference, and
+§6.2 should not be treated as validated until a Developer-ID build proves it.
+
 ### 5.1 §18 / §6.2 / §17 — the notarized artifact is unbuildable today
-Covered in §1 above. One piece of *good* news the spec does not have: §17's risk
-*"self-disclaim behaviour under Hardened Runtime is unverified"* is **retired**. Ad-hoc plus
-`-o runtime` behaves identically to unsigned, including inside a signed `.app`. Only the
-Developer ID / notarization half of that risk remains open.
+Covered in §1.1 above. One narrower risk from §17 *is* retired: the disclaim's
+*mechanical* behaviour under Hardened Runtime is confirmed — ad-hoc plus `-o runtime`
+re-execs exactly once and flips the responsible pid to self, identically to unsigned, and
+identically inside a signed `.app`. What §1.0 shows is that the mechanism working
+mechanically is not the same as the permission story working, so the rest of §17's concern
+stands.
 
 ### 5.2 §10.1 — "`rcc serve` targets MCP spec revision `2026-07-28`"
 **Contradicted, and this one would silently break the product.** Revision 2026-07-28

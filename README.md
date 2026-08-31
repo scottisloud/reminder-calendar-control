@@ -10,15 +10,18 @@ Personal-use, single-machine, macOS 26+. See [SPEC.md](SPEC.md) for the full des
 
 **Milestone 1a of 7 — platform & packaging proof.**
 
-Delivered: the TCC self-disclaim mechanism and its one-time guard, the embedded
-`Info.plist` and Hardened Runtime signing profile, one authoritative install path,
-`rcc doctor`, the tool-owned dev calendar and reminder list, a minimal MCP stdio server,
-and an acceptance harness that proves read/write from all three launch contexts.
+Built: the TCC self-disclaim mechanism and its one-time guard, the embedded `Info.plist`
+and Hardened Runtime signing profile, one authoritative install path, `rcc doctor`, the
+tool-owned dev calendar and reminder list, the EventKit adapter, a minimal MCP stdio
+server, and the three-context acceptance harness.
 
-Not delivered, and gated on an Apple Developer ID certificate this machine does not have:
-the Developer-ID-signed, notarized artifact SPEC §18 asks Milestone 1 to be proven against.
-See [docs/milestone-1.md](docs/milestone-1.md) for exactly what that blocks and what it
-costs day to day.
+**Not yet proven, and blocked.** Two blockers, both traced to the absence of an Apple
+Developer ID certificate on this machine. The second one matters more than it sounds: with
+the self-disclaim active, macOS returns `granted = false` with no error and no dialog, while
+the identical binary run without the disclaim prompts and is granted normally. The likely
+cause is that an ad-hoc signature gives tccd no stable identity to record a grant against.
+So the acceptance matrix runs but does not pass. [docs/milestone-1.md §1](docs/milestone-1.md)
+has the measurements.
 
 Calendar and reminder CRUD arrives in Milestones 3 and 4; automation in 6 and 7.
 
@@ -54,7 +57,7 @@ anything.
 
 ```bash
 swift build            # debug
-swift test             # 107 tests, no EventKit or TCC involvement
+swift test             # 109 tests, no EventKit or TCC involvement
 ./Scripts/build-release.sh
 ./Scripts/m1-acceptance.sh
 ```

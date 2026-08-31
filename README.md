@@ -57,13 +57,15 @@ anything.
 
 ```bash
 swift build            # debug
-swift test             # 116 tests, no EventKit or TCC involvement
+swift test             # 117 tests, no EventKit or TCC involvement
 ./Scripts/build-release.sh
 ./Scripts/m1-acceptance.sh
 ```
 
 Everything above the `CalendarRepository` protocol is testable against an in-memory fake,
-so the unit suite never touches a real calendar or triggers a permission prompt.
+so the unit suite never touches a real calendar or triggers a permission prompt. Under
+`swift test`, every writable path — state, logs, LaunchAgents, the Claude Desktop config —
+is redirected to a throwaway directory, so a test cannot reach your real ones.
 
 ## Layout
 

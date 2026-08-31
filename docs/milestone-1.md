@@ -148,6 +148,37 @@ Out of scope for Milestone 1 and deliberately absent: the event/reminder CRUD to
 automation (§11, Milestones 6–7). `rcc automations run` exists only because the LaunchAgent
 installed by `rcc setup` points at it, and it is a logged no-op.
 
+### The optional app bundle
+
+`Scripts/make-app-bundle.sh` produces `RCC.app` — the same binary, wrapped, with the app
+icon in `Contents/Resources`. It is `LSBackgroundOnly` and `LSUIElement`: no dock tile, no
+menu bar item, no windows. SPEC §3's "not a GUI app" still holds; this is a packaging shape,
+not an interface.
+
+Two reasons it exists:
+
+* **A bare Mach-O cannot carry an icon.** macOS reads it from
+  `Contents/Resources/<CFBundleIconFile>.icns`; there is no linker section for icon data.
+  The TCC dialog and the System Settings › Privacy entry both render that icon, so once the
+  grant works, this is the difference between a recognisable entry and a generic one.
+* **UserNotifications is unreachable without a bundle** (§5.10a), so the notification
+  responsibility SPEC §6.1 assigns to `rcc setup` needs this shape eventually.
+
+**It does not fix the TCC blocker, and was measured not to.** Probe C in §1.0 was exactly
+this: a headless `.app`, disclaimed, exec'd directly — `granted=false`, no dialog. Do not
+reach for the bundle expecting it to unblock the milestone.
+
+The bare binary stays the default install for a concrete reason: replacing a single file is
+a true atomic `rename()`, so the path is never observed half-written (SPEC §6.1). A
+directory cannot be renamed over a non-empty directory, so `install.sh --bundle` moves the
+old bundle aside first — leaving a brief window where the path does not exist. That is worse
+than the bare install, and worth keeping as the non-default until there is a reason to
+prefer the bundle.
+
+`rcc doctor` gains an `install_shape` check that reports which shape is present, whether the
+icon is there, and — importantly — warns when *both* are installed, since that is exactly
+the split install §6.1 exists to make visible.
+
 ---
 
 ## 3. The disclaim mechanism, and a bug in the spec's version of it
@@ -360,8 +391,9 @@ Not done, deliberately. `UNUserNotificationCenter.current()` aborts the process 
 — for an executable with no bundle identifier, and even with an embedded plist a bundle-less
 client's authorization stays `notDetermined` and `add()` fails. `rcc setup` reports the
 capability instead of requesting anything, and notifications go through `osascript`,
-attributed to Script Editor rather than to `rcc`. A signed helper `.app` is the real fix and
-is deferred with the rest of the bundling question. Notification delivery is advisory in any
+attributed to Script Editor rather than to `rcc`. The real fix is the bundle shape §2 now
+provides — `Scripts/make-app-bundle.sh` — but wiring UserNotifications to it is deferred
+until the bundle is something more than an option. Notification delivery is advisory in any
 case: SPEC §8.3 is explicit that it never gates whether an action was staged.
 
 ### 5.10b §7.1 — `rcc setup --rotate-key` is absent

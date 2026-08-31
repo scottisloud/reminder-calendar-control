@@ -67,14 +67,55 @@ public enum RCCPaths {
             .appendingPathComponent(productDirectoryName, isDirectory: true)
     }
 
-    /// The one authoritative binary location (SPEC §6.1).
-    public static var installedBinary: URL {
-        supportRoot.appendingPathComponent("bin", isDirectory: true)
-            .appendingPathComponent("rcc", isDirectory: false)
+    /// How `rcc` is installed. SPEC §6.1 wants exactly one authoritative binary; this is
+    /// which *shape* that binary takes.
+    public enum InstallShape: String, Sendable {
+        /// `bin/rcc` — the default. A true atomic `rename()` on update.
+        case bare
+        /// `RCC.app/Contents/MacOS/rcc` — carries the app icon, which a bare Mach-O cannot,
+        /// and is the shape UserNotifications would need. Updating a bundle is not a single
+        /// rename, so the path is briefly absent rather than atomically swapped.
+        case bundle
     }
 
     public static var binDirectory: URL {
         supportRoot.appendingPathComponent("bin", isDirectory: true)
+    }
+
+    /// `~/Library/Application Support/reminder-calendar-control/bin/rcc`
+    public static var bareBinary: URL {
+        binDirectory.appendingPathComponent("rcc", isDirectory: false)
+    }
+
+    /// `~/Library/Application Support/reminder-calendar-control/RCC.app`
+    public static var appBundle: URL {
+        supportRoot.appendingPathComponent("RCC.app", isDirectory: true)
+    }
+
+    /// The executable inside the bundle — what Claude Desktop and launchd would invoke.
+    public static var bundledBinary: URL {
+        appBundle
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("rcc", isDirectory: false)
+    }
+
+    /// Every shape currently present on disk. More than one means a split install, which is
+    /// exactly the drift SPEC §6.1 wants immediately visible rather than silently running
+    /// mismatched versions.
+    public static var installedShapes: [InstallShape] {
+        var shapes: [InstallShape] = []
+        if FileManager.default.fileExists(atPath: bundledBinary.path) { shapes.append(.bundle) }
+        if FileManager.default.fileExists(atPath: bareBinary.path) { shapes.append(.bare) }
+        return shapes
+    }
+
+    /// The one authoritative binary location (SPEC §6.1).
+    ///
+    /// The bundle wins when both exist, because it is the more specific install — but
+    /// `rcc doctor` reports the ambiguity rather than letting the tie-break hide it.
+    public static var installedBinary: URL {
+        installedShapes.first == .bundle ? bundledBinary : bareBinary
     }
 
     /// SQLite database holding automation rules, the operation journal, the audit log,

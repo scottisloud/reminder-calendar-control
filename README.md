@@ -32,6 +32,18 @@ Calendar and reminder CRUD arrives in Milestones 3 and 4; automation in 6 and 7.
 "$HOME/Library/Application Support/reminder-calendar-control/bin/rcc" setup --dev
 ```
 
+A headless app bundle is available as an alternative shape:
+
+```bash
+./Scripts/install.sh --bundle
+"$HOME/Library/Application Support/reminder-calendar-control/RCC.app/Contents/MacOS/rcc" setup --dev
+```
+
+`RCC.app` is `LSBackgroundOnly` — no dock tile, no menu bar item, no windows — and exists so
+the tool can carry an app icon, which a bare Mach-O cannot. It does **not** fix the TCC
+blocker; that was measured directly. The bare binary remains the default because replacing a
+single file is a true atomic rename, whereas replacing a bundle is not.
+
 `setup` must run from the installed path — macOS records the Calendar and Reminders grant
 against whichever binary asked for it, so granting from a build directory grants it to a
 copy nothing else runs.
@@ -49,6 +61,8 @@ Then quit Claude Desktop fully (⌘Q) and relaunch; it does not reload its confi
 | `rcc selftest [--json] [--context <name>]` | Prove read/write against the dev fixtures from this launch context |
 | `rcc automations run` | What launchd invokes on a schedule (a no-op until Milestone 6) |
 
+Build the bundle on its own with `./Scripts/make-app-bundle.sh`.
+
 Approval of staged automation actions is deliberately CLI-only and will never be an MCP
 tool (SPEC §6.4, §8.3): a model-callable approval tool does not prove a human approved
 anything.
@@ -57,7 +71,7 @@ anything.
 
 ```bash
 swift build            # debug
-swift test             # 117 tests, no EventKit or TCC involvement
+swift test             # 128 tests, no EventKit or TCC involvement
 ./Scripts/build-release.sh
 ./Scripts/m1-acceptance.sh
 ```
@@ -70,6 +84,7 @@ is redirected to a throwaway directory, so a test cannot reach your real ones.
 ## Layout
 
 ```
+Resources/         embedded Info.plist, and the app icon (.icns + Icon Composer source)
 Sources/
   CDisclaim/       C shim over the two private libquarantine symbols
   RCCBootstrap/    the self-disclaim mechanism — runs before anything else

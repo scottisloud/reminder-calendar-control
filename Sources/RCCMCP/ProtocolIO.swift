@@ -79,16 +79,42 @@ public enum ProtocolIO {
     /// Deliberately not `readLine()`: it goes through buffered stdio, which we have just
     /// repointed, and it cannot distinguish an empty line from EOF.
     public static func readFrames(_ handle: (Data) async -> Void) async {
-        var buffer = Data()
+        var splitter = FrameSplitter()
         let input = FileHandle.standardInput
         while let chunk = try? input.read(upToCount: 64 * 1024), !chunk.isEmpty {
-            buffer.append(chunk)
-            while let newline = buffer.firstIndex(of: 0x0A) {
-                let line = Data(buffer[buffer.startIndex..<newline])
-                buffer = Data(buffer[buffer.index(after: newline)...])
-                guard !line.isEmpty else { continue }
-                await handle(line)
+            for frame in splitter.append(chunk) {
+                await handle(frame)
             }
         }
     }
+}
+
+/// Accumulates bytes and yields complete newline-delimited frames.
+///
+/// Its own type so the index arithmetic is testable without a pipe. The hazard it exists to
+/// avoid: a `Data` produced by slicing keeps the *parent's* index base, so a sliced buffer
+/// has a non-zero `startIndex` and naive `buffer[0..<n]` arithmetic silently reads the wrong
+/// bytes — or traps. Every slice here is re-based through `Data(...)`, and there is a test
+/// that feeds a frame in one byte at a time to prove it.
+public struct FrameSplitter {
+    private var buffer = Data()
+
+    public init() {}
+
+    /// Append a chunk and return whatever complete frames that produced. A frame may span
+    /// any number of chunks, and one chunk may contain many frames or none.
+    public mutating func append(_ chunk: Data) -> [Data] {
+        buffer.append(chunk)
+        var frames: [Data] = []
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            let frame = Data(buffer[buffer.startIndex..<newline])
+            buffer = Data(buffer[buffer.index(after: newline)...])
+            // Blank lines are padding, not frames.
+            if !frame.isEmpty { frames.append(frame) }
+        }
+        return frames
+    }
+
+    /// Bytes held for an incomplete frame. Non-zero at EOF means the peer truncated a frame.
+    public var pendingByteCount: Int { buffer.count }
 }

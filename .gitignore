@@ -1,0 +1,26 @@
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved.bak
+*.xcodeproj
+*.xcworkspace
+
+# Build / release artifacts
+/dist/
+/artifacts/
+*.dSYM/
+*.zip
+
+# Local secrets & signing material
+*.p12
+*.cer
+*.provisionprofile
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/

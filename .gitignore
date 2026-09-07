@@ -11,6 +11,10 @@ Package.resolved.bak
 *.dSYM/
 *.zip
 
+# swiftly toolchain installer + local pin (left to each machine for now)
+/swiftly.pkg
+/.swift-version
+
 # Local secrets & signing material
 *.p12
 *.cer

@@ -34,6 +34,12 @@ public protocol CalendarRepository: Sendable {
     func createReminder(_ draft: ReminderDraft) async throws -> String
     func reminders(inCalendar calendarIdentifier: String) async throws -> [ReminderSummary]
     func deleteReminder(identifier: String) async throws
+
+    /// Whether an item with this identifier currently resolves. Crash recovery (SPEC §9.6)
+    /// uses it to decide whether a mid-flight mutation reached its expected state. Returns
+    /// `false` rather than throwing when access is missing — the caller (`Reconciler`)
+    /// checks authorization itself and does not probe at all when it is absent.
+    func itemExists(identifier: String, entityType: RCCEntityType) async -> Bool
 }
 
 public enum RCCEntityType: String, Sendable, CaseIterable {

@@ -224,6 +224,17 @@ public actor EventKitRepository: CalendarRepository {
         }
     }
 
+    public func itemExists(identifier: String, entityType: RCCEntityType) async -> Bool {
+        guard Self.map(EKEventStore.authorizationStatus(for: entityType.ekEntityType)).grantsFullAccess
+        else { return false }
+        switch entityType {
+        case .event:
+            return store.event(withIdentifier: identifier) != nil
+        case .reminder:
+            return (store.calendarItem(withIdentifier: identifier) as? EKReminder) != nil
+        }
+    }
+
     // MARK: - Source selection
 
     /// Pick a source for a tool-owned calendar.

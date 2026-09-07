@@ -8,47 +8,53 @@ Personal-use, single-machine, macOS 26+. See [SPEC.md](SPEC.md) for the full des
 
 ## Status
 
-**Milestone 1a of 7 — platform & packaging proof.**
+**Milestone 1 of 7 — platform & packaging proof — DONE.**
 
-Built: the TCC self-disclaim mechanism and its one-time guard, the embedded `Info.plist`
-and Hardened Runtime signing profile, one authoritative install path, `rcc doctor`, the
-tool-owned dev calendar and reminder list, the EventKit adapter, a minimal MCP stdio
-server, and the three-context acceptance harness.
+Claude Desktop can talk to `rcc` end to end: a Desktop-spawned `rcc serve` has full
+Calendar and Reminders access and passes its platform self-test.
 
-**Not yet proven, and blocked.** Two blockers, both traced to the absence of an Apple
-Developer ID certificate on this machine. The second one matters more than it sounds: with
-the self-disclaim active, macOS returns `granted = false` with no error and no dialog, while
-the identical binary run without the disclaim prompts and is granted normally. The likely
-cause is that an ad-hoc signature gives tccd no stable identity to record a grant against.
-So the acceptance matrix runs but does not pass. [docs/milestone-1.md §1](docs/milestone-1.md)
-has the measurements.
+Built: the embedded `Info.plist` + Hardened Runtime + `personal-information` entitlements
+signing profile, notarization, one authoritative install path, the TCC self-disclaim
+mechanism (kept but redundant — Claude Desktop disclaims MCP servers itself), a foreground
+`NSApplication` grant flow for `rcc setup`, `rcc doctor`, the tool-owned dev calendar and
+reminder list, the EventKit adapter, and a hand-rolled MCP stdio server.
+
+The blocker that stood from the initial commit — a disclaimed headless binary could not
+obtain a Calendar/Reminders grant on macOS 26 — turned out to need two things a Developer
+ID signature alone did not provide: the `com.apple.security.personal-information.*`
+entitlements (macOS 26.5 gates the prompt on them) and a foreground `NSApplication` for the
+request. Plus a `read(2)` fix for a stdin hang that only a live MCP client triggered. Full
+account in [docs/milestone-1b-findings.md](docs/milestone-1b-findings.md).
 
 Calendar and reminder CRUD arrives in Milestones 3 and 4; automation in 6 and 7.
 
 ## Install
 
+Needs an Apple Developer ID certificate and a `notarytool` keychain profile — macOS 26
+will not present the Calendar/Reminders prompt for an ad-hoc binary.
+
 ```bash
-./Scripts/install.sh
+export RCC_NOTARY_PROFILE=<your-notarytool-profile>
+./Scripts/build-release.sh --notarize          # Developer ID + entitlements + notarize
+./Scripts/install.sh --skip-build              # atomic install to the stable path
 "$HOME/Library/Application Support/reminder-calendar-control/bin/rcc" setup --dev
 ```
 
-A headless app bundle is available as an alternative shape:
+`setup` **must be run interactively from a real terminal** (Terminal.app, Ghostty, …). It
+brings up a foreground `NSApplication` and requests Calendar and Reminders access — approve
+both macOS dialogs. A non-interactive run reports what is missing and exits non-zero. The
+grant is recorded against `rcc`'s own designated requirement, so a later Desktop-spawned
+`rcc serve` matches it.
 
-```bash
-./Scripts/install.sh --bundle
-"$HOME/Library/Application Support/reminder-calendar-control/RCC.app/Contents/MacOS/rcc" setup --dev
-```
-
-`RCC.app` is `LSBackgroundOnly` — no dock tile, no menu bar item, no windows — and exists so
-the tool can carry an app icon, which a bare Mach-O cannot. It does **not** fix the TCC
-blocker; that was measured directly. The bare binary remains the default because replacing a
-single file is a true atomic rename, whereas replacing a bundle is not.
-
-`setup` must run from the installed path — macOS records the Calendar and Reminders grant
-against whichever binary asked for it, so granting from a build directory grants it to a
-copy nothing else runs.
+`setup` must also run from the installed path — macOS records the grant against whichever
+binary asked for it, so granting from a build directory grants a copy nothing else runs.
 
 Then quit Claude Desktop fully (⌘Q) and relaunch; it does not reload its config file.
+
+A headless app bundle (`./Scripts/install.sh --bundle` → `RCC.app`, `LSUIElement`, no
+windows) exists only so the tool can carry an app icon, which a bare Mach-O cannot. It is
+not required for TCC — that was measured directly. The bare binary is the default because
+replacing one file is a true atomic rename; replacing a bundle is not.
 
 ## Commands
 
@@ -84,12 +90,14 @@ is redirected to a throwaway directory, so a test cannot reach your real ones.
 ## Layout
 
 ```
-Resources/         embedded Info.plist, and the app icon (.icns + Icon Composer source)
+Resources/         embedded Info.plist, Entitlements.plist, app icon (.icns + Icon Composer)
 Sources/
   CDisclaim/       C shim over the two private libquarantine symbols
-  RCCBootstrap/    the self-disclaim mechanism — runs before anything else
+  RCCBootstrap/    the self-disclaim mechanism — runs before anything else (redundant with
+                   Claude Desktop's own disclaimer shim; kept for `rcc setup` attribution)
   RCCCore/         paths, exit codes, logging, redaction, SQLite state
-  RCCCalendar/     EventKit protocol, real adapter, in-memory fake, dev fixtures
+  RCCCalendar/     EventKit protocol, real adapter, in-memory fake, dev fixtures,
+                   InteractiveGrant (foreground NSApplication for the first TCC prompt)
   RCCPlatform/     code signing, launchd, Claude Desktop config, Keychain, notifications
   RCCDiagnostics/  rcc doctor and the acceptance self-test
   RCCMCP/          MCP stdio server

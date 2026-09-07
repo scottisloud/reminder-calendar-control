@@ -86,14 +86,37 @@ public enum ProtocolIO {
     /// Read newline-delimited frames from stdin until EOF.
     ///
     /// EOF means Claude Desktop closed the pipe; the caller exits rather than hanging.
-    /// Deliberately not `readLine()`: it goes through buffered stdio, which we have just
-    /// repointed, and it cannot distinguish an empty line from EOF.
+    ///
+    /// Uses `read(2)` directly, NOT `FileHandle.read(upToCount:)` and NOT `readLine()`:
+    ///
+    ///  * `readLine()` goes through buffered stdio, which `activate()` has just repointed,
+    ///    and cannot tell an empty line from EOF.
+    ///  * `FileHandle.read(upToCount:)` on a pipe blocks until it has filled the whole
+    ///    requested buffer or seen EOF — it does not return the bytes already available.
+    ///    A streaming JSON-RPC peer never closes the pipe, so the first `initialize` frame
+    ///    would sit unread until the 60s client timeout. This is why the bug only showed
+    ///    under a live Claude Desktop connection and not when tests pipe a fixture that
+    ///    ends in EOF.
+    ///
+    /// `read(2)` returns as soon as any bytes are available, which is the correct
+    /// behaviour for an interactive stream.
     public static func readFrames(_ handle: (Data) async -> Void) async {
         var splitter = FrameSplitter()
-        let input = FileHandle.standardInput
-        while let chunk = try? input.read(upToCount: 64 * 1024), !chunk.isEmpty {
-            for frame in splitter.append(chunk) {
-                await handle(frame)
+        let capacity = 64 * 1024
+        var buffer = [UInt8](repeating: 0, count: capacity)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { raw in
+                read(STDIN_FILENO, raw.baseAddress, capacity)
+            }
+            if count > 0 {
+                for frame in splitter.append(Data(buffer[0..<count])) {
+                    await handle(frame)
+                }
+            } else if count == 0 {
+                return  // EOF: the peer closed the pipe.
+            } else if errno != EINTR {
+                Log.shared.error("mcp.stdin_read_failed", ["errno": .int(Int(errno))])
+                return
             }
         }
     }

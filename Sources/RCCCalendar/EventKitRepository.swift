@@ -319,15 +319,6 @@ public actor EventKitRepository: CalendarRepository {
         return RCCAuthorizationStatus(known: known, rawValue: Int(status.rawValue))
     }
 
-    static func summarize(source: EKSource) -> SourceSummary {
-        SourceSummary(
-            id: source.sourceIdentifier,
-            title: source.title,
-            sourceType: name(for: source.sourceType),
-            sourceTypeRawValue: Int(source.sourceType.rawValue)
-        )
-    }
-
     static func name(for sourceType: EKSourceType) -> String {
         switch sourceType {
         case .local: return "local"
@@ -342,10 +333,27 @@ public actor EventKitRepository: CalendarRepository {
         }
     }
 
+    static func summarize(source: EKSource) -> SourceSummary {
+        SourceSummary(
+            id: source.sourceIdentifier,
+            title: source.title,
+            sourceType: name(for: source.sourceType),
+            sourceTypeRawValue: Int(source.sourceType.rawValue),
+            isDelegate: source.isDelegate
+        )
+    }
+
     static func summarize(calendar: EKCalendar) -> CalendarSummary {
         var allowed: Set<RCCEntityType> = []
         if calendar.allowedEntityTypes.contains(.event) { allowed.insert(.event) }
         if calendar.allowedEntityTypes.contains(.reminder) { allowed.insert(.reminder) }
+        let mask = calendar.supportedEventAvailabilities
+        let availabilities: [String] = [
+            (EKCalendarEventAvailabilityMask.busy, "busy"),
+            (.free, "free"),
+            (.tentative, "tentative"),
+            (.unavailable, "unavailable"),
+        ].compactMap { mask.contains($0.0) ? $0.1 : nil }
         return CalendarSummary(
             id: calendar.calendarIdentifier,
             title: calendar.title,
@@ -354,7 +362,10 @@ public actor EventKitRepository: CalendarRepository {
             isImmutable: calendar.isImmutable,
             allowedEntityTypes: allowed,
             sourceIdentifier: calendar.source?.sourceIdentifier,
-            sourceTitle: calendar.source?.title
+            sourceTitle: calendar.source?.title,
+            colorHex: hexString(from: calendar.cgColor),
+            type: EnumValue(name: calendarTypeName(calendar.type), raw: Int(calendar.type.rawValue)),
+            supportedEventAvailabilities: availabilities
         )
     }
 
@@ -362,22 +373,192 @@ public actor EventKitRepository: CalendarRepository {
         guard let identifier = event.eventIdentifier,
               let start = event.startDate,
               let end = event.endDate else { return nil }
-        return EventSummary(
+        var dto = EventSummary(
             id: identifier,
             title: event.title ?? "",
             start: start,
             end: end,
-            calendarIdentifier: event.calendar?.calendarIdentifier ?? ""
+            calendarIdentifier: event.calendar?.calendarIdentifier ?? "",
+            isAllDay: event.isAllDay,
+            timeZoneIdentifier: event.timeZone?.identifier,
+            location: event.location,
+            structuredLocation: geo(from: event.structuredLocation),
+            notes: event.hasNotes ? event.notes : nil,
+            url: event.url?.absoluteString,
+            status: EnumValue(name: statusName(event.status), raw: Int(event.status.rawValue)),
+            availability: EnumValue(
+                name: availabilityName(for: event.availability), raw: Int(event.availability.rawValue)
+            ),
+            isRecurring: event.hasRecurrenceRules,
+            isDetached: event.isDetached,
+            occurrenceDate: event.occurrenceDate,
+            recurrenceRules: (event.recurrenceRules ?? []).map(RecurrenceRule.init),
+            alarms: (event.alarms ?? []).map(alarm(from:)),
+            participants: (event.attendees ?? []).map { participant(from: $0) },
+            organizer: event.organizer.map { participant(from: $0) },
+            birthdayContactIdentifier: event.birthdayContactIdentifier,
+            created: event.creationDate,
+            lastModified: event.lastModifiedDate,
+            sourceIdentifier: event.calendar?.source?.sourceIdentifier
         )
+        dto.version = ContentVersion.make(dto.contentFields, lastModified: event.lastModifiedDate)
+        return dto
     }
 
     static func summarize(reminder: EKReminder) -> ReminderSummary {
-        ReminderSummary(
+        var dto = ReminderSummary(
             id: reminder.calendarItemIdentifier,
             title: reminder.title ?? "",
             isCompleted: reminder.isCompleted,
-            calendarIdentifier: reminder.calendar?.calendarIdentifier ?? ""
+            calendarIdentifier: reminder.calendar?.calendarIdentifier ?? "",
+            notes: reminder.hasNotes ? reminder.notes : nil,
+            url: reminder.url?.absoluteString,
+            location: reminder.location,
+            timeZoneIdentifier: reminder.timeZone?.identifier,
+            dueDate: reminder.dueDateComponents.map(DateComponentsDTO.init),
+            startDate: reminder.startDateComponents.map(DateComponentsDTO.init),
+            completionDate: reminder.completionDate,
+            priorityRaw: reminder.priority,
+            priorityBucket: ReminderPriorityBucket(raw: reminder.priority).rawValue,
+            recurrenceRules: (reminder.recurrenceRules ?? []).map(RecurrenceRule.init),
+            alarms: (reminder.alarms ?? []).map(alarm(from:)),
+            created: reminder.creationDate,
+            lastModified: reminder.lastModifiedDate,
+            sourceIdentifier: reminder.calendar?.source?.sourceIdentifier
         )
+        dto.version = ContentVersion.make(dto.contentFields, lastModified: reminder.lastModifiedDate)
+        return dto
+    }
+
+    // MARK: - Enum & value mapping
+
+    static func statusName(_ status: EKEventStatus) -> String {
+        switch status {
+        case .none: return "none"
+        case .confirmed: return "confirmed"
+        case .tentative: return "tentative"
+        case .canceled: return "canceled"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func availabilityName(for availability: EKEventAvailability) -> String {
+        switch availability {
+        case .notSupported: return "notSupported"
+        case .busy: return "busy"
+        case .free: return "free"
+        case .tentative: return "tentative"
+        case .unavailable: return "unavailable"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func calendarTypeName(_ type: EKCalendarType) -> String {
+        switch type {
+        case .local: return "local"
+        case .calDAV: return "calDAV"
+        case .exchange: return "exchange"
+        case .subscription: return "subscription"
+        case .birthday: return "birthday"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func participant(from participant: EKParticipant) -> Participant {
+        let url = participant.url.absoluteString
+        let email = url.lowercased().hasPrefix("mailto:") ? String(url.dropFirst("mailto:".count)) : nil
+        return Participant(
+            name: participant.name,
+            url: url,
+            email: email,
+            isCurrentUser: participant.isCurrentUser,
+            type: EnumValue(name: participantTypeName(participant.participantType),
+                            raw: Int(participant.participantType.rawValue)),
+            role: EnumValue(name: participantRoleName(participant.participantRole),
+                            raw: Int(participant.participantRole.rawValue)),
+            status: EnumValue(name: participantStatusName(participant.participantStatus),
+                              raw: Int(participant.participantStatus.rawValue))
+        )
+    }
+
+    static func participantTypeName(_ type: EKParticipantType) -> String {
+        switch type {
+        case .unknown: return "unknown"
+        case .person: return "person"
+        case .room: return "room"
+        case .resource: return "resource"
+        case .group: return "group"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func participantRoleName(_ role: EKParticipantRole) -> String {
+        switch role {
+        case .unknown: return "unknown"
+        case .required: return "required"
+        case .optional: return "optional"
+        case .chair: return "chair"
+        case .nonParticipant: return "nonParticipant"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func participantStatusName(_ status: EKParticipantStatus) -> String {
+        switch status {
+        case .unknown: return "unknown"
+        case .pending: return "pending"
+        case .accepted: return "accepted"
+        case .declined: return "declined"
+        case .tentative: return "tentative"
+        case .delegated: return "delegated"
+        case .completed: return "completed"
+        case .inProcess: return "inProcess"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func alarm(from alarm: EKAlarm) -> Alarm {
+        let typeName: String
+        switch alarm.type {
+        case .display: typeName = "display"
+        case .audio: typeName = "audio"
+        case .procedure: typeName = "procedure"
+        case .email: typeName = "email"
+        @unknown default: typeName = "unknown"
+        }
+        let proximity: EnumValue?
+        switch alarm.proximity {
+        case .none: proximity = nil
+        case .enter: proximity = EnumValue(name: "enter", raw: Int(alarm.proximity.rawValue))
+        case .leave: proximity = EnumValue(name: "leave", raw: Int(alarm.proximity.rawValue))
+        @unknown default: proximity = EnumValue(name: "unknown", raw: Int(alarm.proximity.rawValue))
+        }
+        return Alarm(
+            type: EnumValue(name: typeName, raw: Int(alarm.type.rawValue)),
+            relativeOffset: alarm.absoluteDate == nil ? alarm.relativeOffset : nil,
+            absoluteDate: alarm.absoluteDate,
+            structuredLocation: geo(from: alarm.structuredLocation),
+            proximity: proximity
+        )
+    }
+
+    static func geo(from location: EKStructuredLocation?) -> GeoLocation? {
+        guard let location else { return nil }
+        let coordinate = location.geoLocation?.coordinate
+        return GeoLocation(
+            title: location.title,
+            latitude: coordinate?.latitude,
+            longitude: coordinate?.longitude,
+            radius: location.radius == 0 ? nil : location.radius
+        )
+    }
+
+    static func hexString(from color: CGColor?) -> String? {
+        guard let color, let components = color.components, components.count >= 3 else { return nil }
+        let r = Int((components[0] * 255).rounded())
+        let g = Int((components[1] * 255).rounded())
+        let b = Int((components[2] * 255).rounded())
+        return String(format: "#%02x%02x%02x", r, g, b)
     }
 }
 

@@ -140,13 +140,16 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         try requireAccess(.event)
         try consumeInjectedFailure()
         let calendar = try writableCalendar(draft.calendarIdentifier, entityType: .event)
-        let event = EventSummary(
+        var event = EventSummary(
             id: mintIdentifier("evt"),
             title: draft.title,
             start: draft.start,
             end: draft.end,
-            calendarIdentifier: calendar.id
+            calendarIdentifier: calendar.id,
+            notes: draft.notes,
+            sourceIdentifier: calendar.sourceIdentifier
         )
+        event.version = ContentVersion.make(event.contentFields)
         storedEvents[event.id] = event
         return event.id
     }
@@ -172,12 +175,15 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         try requireAccess(.reminder)
         try consumeInjectedFailure()
         let calendar = try writableCalendar(draft.calendarIdentifier, entityType: .reminder)
-        let reminder = ReminderSummary(
+        var reminder = ReminderSummary(
             id: mintIdentifier("rem"),
             title: draft.title,
             isCompleted: false,
-            calendarIdentifier: calendar.id
+            calendarIdentifier: calendar.id,
+            notes: draft.notes,
+            sourceIdentifier: calendar.sourceIdentifier
         )
+        reminder.version = ContentVersion.make(reminder.contentFields)
         storedReminders[reminder.id] = reminder
         return reminder.id
     }

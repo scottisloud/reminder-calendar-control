@@ -197,6 +197,13 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         }
     }
 
+    public func itemExists(identifier: String, entityType: RCCEntityType) async -> Bool {
+        switch entityType {
+        case .event: return storedEvents[identifier] != nil
+        case .reminder: return storedReminders[identifier] != nil
+        }
+    }
+
     // MARK: - Helpers
 
     private func requireAccess(_ entityType: RCCEntityType) throws {

@@ -17,6 +17,13 @@ public enum RCCTime {
         instantStyle.format(date)
     }
 
+    /// Parse an instant produced by `instant(_:)` (or any RFC 3339 string) back to a
+    /// `Date`. Accepts values with or without fractional seconds. Returns `nil` on garbage.
+    public static func parse(_ string: String) -> Date? {
+        if let date = try? Date(string, strategy: instantStyle) { return date }
+        return try? Date(string, strategy: Date.ISO8601FormatStyle(timeZone: .gmt))
+    }
+
     /// Local calendar date, `YYYY-MM-DD`. Used for daily log-file names, where the
     /// operator's expectation is "today's log", not "today in UTC".
     public static func localDay(_ date: Date = Date(), calendar: Calendar = .current) -> String {

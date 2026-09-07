@@ -14,7 +14,7 @@ import SQLite3
 public final class Store: @unchecked Sendable {
     /// Bump this and append to `migrations` for every schema change. Never edit an
     /// existing migration — a released binary has already applied it.
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
 
     private let handle: OpaquePointer
     public let url: URL
@@ -77,6 +77,68 @@ public final class Store: @unchecked Sendable {
             source_title      TEXT,
             created_at        TEXT NOT NULL
         );
+        """,
+
+        // v2 — Milestone 2 durable-state foundation (SPEC §9.4, §9.6).
+        """
+        -- Small key/value scratch for monotonic counters and watermarks.
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO meta (key, value) VALUES ('locator_generation', '0');
+
+        -- Opaque locators (SPEC §9.4). `handle` is a server-issued random string with no
+        -- decodable structure, so a caller (or prompt-injected model output) cannot
+        -- fabricate or tamper with one. Rows are deleted wholesale when the EventKit store
+        -- changes; `generation` records which era a handle belongs to so a stale handle is
+        -- rejected rather than silently resolved.
+        CREATE TABLE IF NOT EXISTS locators (
+            handle           TEXT PRIMARY KEY,
+            entity_type      TEXT NOT NULL CHECK (entity_type IN ('event', 'reminder')),
+            calendar_id      TEXT NOT NULL,
+            source_id        TEXT,
+            item_identifier  TEXT NOT NULL,
+            external_id      TEXT,
+            occurrence_date  TEXT,
+            generation       INTEGER NOT NULL,
+            issued_at        TEXT NOT NULL,
+            expires_at       TEXT NOT NULL,
+            schema_version   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS locators_item ON locators (item_identifier);
+        CREATE INDEX IF NOT EXISTS locators_expiry ON locators (expires_at);
+
+        -- Operation journal (SPEC §9.6). A row is written at `prepared` BEFORE EventKit is
+        -- touched; the state machine is prepared -> executing -> succeeded|failed, and
+        -- executing -> outcome_unknown -> reconciled|needs_human_review.
+        -- `intent_json` is the canonical arguments with note/content text already stripped
+        -- (SPEC §13). `idempotency_key` is unique when present: replaying it within the
+        -- retention window returns this row's recorded outcome instead of re-executing.
+        CREATE TABLE IF NOT EXISTS operation_journal (
+            id                TEXT PRIMARY KEY,
+            kind              TEXT NOT NULL,
+            state             TEXT NOT NULL CHECK (state IN (
+                                  'prepared', 'executing', 'succeeded', 'failed',
+                                  'outcome_unknown', 'reconciled', 'needs_human_review')),
+            context           TEXT NOT NULL CHECK (context IN ('live', 'tier0', 'tier1', 'cli')),
+            intent_json       TEXT NOT NULL,
+            operation_hash    TEXT NOT NULL,
+            idempotency_key   TEXT,
+            target_handle     TEXT,
+            if_match_version  TEXT,
+            recurrence_scope  TEXT CHECK (recurrence_scope IN ('this_occurrence', 'this_and_future')),
+            result_identifier TEXT,
+            outcome_detail    TEXT,
+            error_code        TEXT,
+            prepared_at       TEXT NOT NULL,
+            updated_at        TEXT NOT NULL,
+            schema_version    INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS operation_journal_idem
+            ON operation_journal (idempotency_key) WHERE idempotency_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS operation_journal_state ON operation_journal (state);
+        CREATE INDEX IF NOT EXISTS operation_journal_prepared ON operation_journal (prepared_at);
         """
     ]
 
@@ -231,6 +293,11 @@ public final class Store: @unchecked Sendable {
 
     // MARK: - Primitives
 
+    /// Rows changed by the most recent `run`. Used to enforce state-machine transitions:
+    /// an `UPDATE … WHERE state = <expected>` that changes zero rows means the row was
+    /// not in the expected state.
+    public func changes() -> Int { Int(sqlite3_changes(handle)) }
+
     public func execute(_ sql: String) throws {
         var errorPointer: UnsafeMutablePointer<CChar>?
         guard sqlite3_exec(handle, sql, nil, nil, &errorPointer) == SQLITE_OK else {
@@ -241,15 +308,76 @@ public final class Store: @unchecked Sendable {
     }
 
     public func run(_ sql: String, _ parameters: [String?]) throws {
+        try run(sql, parameters.map { $0.map(SQLValue.text) ?? .null })
+    }
+
+    /// A bound parameter. Text and null were enough for Milestone 1; the journal and
+    /// locator tables (§9.4/§9.6) carry real integers whose ordering matters, so the
+    /// primitives take a typed value now.
+    public enum SQLValue: Sendable, Equatable {
+        case text(String)
+        case int(Int64)
+        case null
+
+        public static func int(_ value: Int) -> SQLValue { .int(Int64(value)) }
+    }
+
+    /// A read cursor over one result row. Column indices are zero-based.
+    public struct Row {
+        fileprivate let statement: OpaquePointer
+
+        public func text(_ index: Int32) -> String? {
+            guard let raw = sqlite3_column_text(statement, index) else { return nil }
+            return String(cString: raw)
+        }
+
+        public func int(_ index: Int32) -> Int64 {
+            sqlite3_column_int64(statement, index)
+        }
+
+        public func isNull(_ index: Int32) -> Bool {
+            sqlite3_column_type(statement, index) == SQLITE_NULL
+        }
+    }
+
+    public func run(_ sql: String, _ values: [SQLValue]) throws {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {
             throw lastError("preparing statement")
         }
         defer { sqlite3_finalize(statement) }
-        try bind(parameters, to: statement)
+        try bind(values, to: statement)
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw lastError("executing statement")
         }
+    }
+
+    /// Run a query and decode every result row.
+    public func queryAll<T>(
+        _ sql: String,
+        _ values: [SQLValue] = [],
+        _ decode: (Row) -> T
+    ) throws -> [T] {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw lastError("preparing query")
+        }
+        defer { sqlite3_finalize(statement) }
+        try bind(values, to: statement)
+        var rows: [T] = []
+        while sqlite3_step(statement) == SQLITE_ROW, let statement {
+            rows.append(decode(Row(statement: statement)))
+        }
+        return rows
+    }
+
+    /// Run a query and decode at most the first result row.
+    public func queryFirst<T>(
+        _ sql: String,
+        _ values: [SQLValue] = [],
+        _ decode: (Row) -> T
+    ) throws -> T? {
+        try queryAll(sql, values, decode).first
     }
 
     private func queryOne<T>(_ sql: String, _ decode: (OpaquePointer) -> T) throws -> T? {
@@ -262,17 +390,17 @@ public final class Store: @unchecked Sendable {
         return decode(statement)
     }
 
-    private func bind(_ parameters: [String?], to statement: OpaquePointer?) throws {
+    private func bind(_ values: [SQLValue], to statement: OpaquePointer?) throws {
         // SQLITE_TRANSIENT: sqlite must copy the bytes, because the Swift String's
         // storage is not guaranteed to outlive this call.
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        for (offset, parameter) in parameters.enumerated() {
+        for (offset, value) in values.enumerated() {
             let index = Int32(offset + 1)
             let status: Int32
-            if let parameter {
-                status = sqlite3_bind_text(statement, index, parameter, -1, transient)
-            } else {
-                status = sqlite3_bind_null(statement, index)
+            switch value {
+            case .text(let string): status = sqlite3_bind_text(statement, index, string, -1, transient)
+            case .int(let number): status = sqlite3_bind_int64(statement, index, number)
+            case .null: status = sqlite3_bind_null(statement, index)
             }
             guard status == SQLITE_OK else { throw lastError("binding parameter \(index)") }
         }

@@ -91,32 +91,7 @@ struct Setup: AsyncParsableCommand {
         // 1. Authorization. Deliberately first: the LaunchAgent and MCP registration are
         //    worthless without it, and this is the step that can actually fail in a way
         //    the user has to resolve in System Settings.
-        for entityType in RCCEntityType.allCases {
-            let before = await repository.authorizationStatus(for: entityType)
-            if before.grantsFullAccess {
-                Output.line("  \(entityType.displayName) access: already granted")
-                continue
-            }
-            if before.known == .denied || before.known == .restricted {
-                throw RCCError(
-                    .permission,
-                    "\(entityType.displayName) access is \(before.known.rawValue); macOS will not prompt again.",
-                    remediation: "Enable rcc under System Settings › Privacy & Security › "
-                        + "\(entityType.displayName), then re-run `rcc setup --verify`."
-                )
-            }
-            Output.line("  \(entityType.displayName) access: requesting…")
-            let after = try await repository.requestFullAccess(for: entityType)
-            guard after.grantsFullAccess else {
-                throw RCCError(
-                    .permission,
-                    "\(entityType.displayName) access was not granted (\(after.description)).",
-                    remediation: "Re-run `rcc setup`, or enable rcc under System Settings › "
-                        + "Privacy & Security › \(entityType.displayName)."
-                )
-            }
-            Output.line("  \(entityType.displayName) access: granted")
-        }
+        try await grantAccess(using: repository)
 
         // 2. Local state. Created after the grant so a denied setup does not leave a
         //    half-initialised database behind.
@@ -168,6 +143,76 @@ struct Setup: AsyncParsableCommand {
         Output.line("reload claude_desktop_config.json while running.")
         Output.line("")
         Output.line("Run `rcc doctor` to confirm, and `rcc selftest` to prove read/write works.")
+    }
+
+    // MARK: - Authorization
+
+    /// Bring Calendar and Reminders to full access, or fail with a clear reason.
+    ///
+    /// The request goes through `InteractiveGrant`, which runs a foreground `NSApplication`
+    /// run loop: on macOS 14+ a bare CLI async request is denied with no dialog, and on
+    /// macOS 26.5+ tccd also needs the `personal-information` entitlements the signed binary
+    /// now carries (docs/milestone-1b-findings.md). A non-interactive invocation
+    /// (LaunchAgent, piped) never spins up AppKit — it reports what is missing and stops.
+    private func grantAccess(using repository: EventKitRepository) async throws {
+        let entities = RCCEntityType.allCases
+
+        var undetermined: [RCCEntityType] = []
+        for entityType in entities {
+            let status = await repository.authorizationStatus(for: entityType)
+            if status.grantsFullAccess {
+                Output.line("  \(entityType.displayName) access: already granted")
+            } else if status.known == .denied || status.known == .restricted {
+                throw RCCError(
+                    .permission,
+                    "\(entityType.displayName) access is \(status.known.rawValue); macOS will not prompt again.",
+                    remediation: "Enable rcc under System Settings › Privacy & Security › "
+                        + "\(entityType.displayName), then re-run `rcc setup --verify`."
+                )
+            } else {
+                undetermined.append(entityType)
+            }
+        }
+
+        guard !undetermined.isEmpty else { return }
+
+        let names = undetermined.map(\.displayName).joined(separator: " and ")
+        guard isInteractive else {
+            throw RCCError(
+                .permission,
+                "\(names) access is not yet granted, and this is not an interactive session "
+                    + "so macOS cannot show the permission dialog.",
+                remediation: "Run this once from Terminal:\n    \(RCCPaths.installedBinary.path) setup"
+            )
+        }
+
+        Output.line("  \(names) access: requesting — approve the macOS dialog(s)…")
+        let outcome = await InteractiveGrant.requestFullAccess(for: undetermined)
+
+        // The stores used for the requests were created while authorization was
+        // undetermined; drop the repository's own store so later steps get a fresh one.
+        await repository.reset()
+
+        for entityType in undetermined {
+            let status = outcome.statuses[entityType] ?? RCCAuthorizationStatus(known: .unknown, rawValue: -1)
+            guard status.grantsFullAccess else {
+                let why = outcome.timedOut
+                    ? "no dialog appeared within the timeout"
+                    : "result: \(status.description)"
+                throw RCCError(
+                    .permission,
+                    "\(entityType.displayName) access was not granted (\(why)).",
+                    remediation: "Re-run `rcc setup`. If no dialog appears at all, check "
+                        + "System Settings › Privacy & Security › \(entityType.displayName) for an `rcc` "
+                        + "entry, and see docs/milestone-1b-findings.md."
+                )
+            }
+            Output.line("  \(entityType.displayName) access: granted")
+        }
+    }
+
+    private var isInteractive: Bool {
+        isatty(STDIN_FILENO) == 1 || isatty(STDOUT_FILENO) == 1
     }
 
     // MARK: - Verify

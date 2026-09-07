@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    macOS 26.5 tightened the TCC prompting policy: tccd refuses to present ANY
+    Calendar/Reminders prompt for a Hardened-Runtime binary that lacks the matching
+    `com.apple.security.personal-information.*` entitlement — the request is denied
+    with no dialog and `authorizationStatus` stays `.notDetermined` forever
+    ("Policy disallows prompt ... access denied"). This is what
+    docs/milestone-1b-findings.md measured, and it reverses SPEC §6.3's original
+    "ship no entitlements" decision, which was correct only through macOS 26.4.
+
+    Both keys are UNRESTRICTED entitlements: valid for Developer ID distribution
+    outside the Mac App Store, no provisioning profile, no App Sandbox, no extra
+    notarization requirements. They must NOT be confused with
+    `com.apple.security.app-sandbox`, which SIGTRAPs a bare CLI before main().
+
+    `Scripts/sign.sh` seals this file into the signature and re-verifies both keys
+    are present on the signed binary.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.personal-information.calendars</key>
+    <true/>
+    <key>com.apple.security.personal-information.reminders</key>
+    <true/>
+</dict>
+</plist>

@@ -92,6 +92,26 @@ struct OperationJournalTests {
         #expect(throws: OperationTransitionError.self) { try store.markExecuting("no-such-id") }
     }
 
+    @Test("recordResultIdentifier writes only while executing")
+    func recordResultIdentifierGuard() throws {
+        let store = try store()
+        let op = try store.prepareOperation(intent())
+
+        // prepared: not yet executing
+        #expect(throws: OperationTransitionError.self) {
+            try store.recordResultIdentifier("EK-1", for: op.id)
+        }
+        try store.markExecuting(op.id)
+        try store.recordResultIdentifier("EK-1", for: op.id)
+        #expect(try store.operation(id: op.id)?.resultIdentifier == "EK-1")
+
+        // terminal: refused
+        try store.markSucceeded(op.id, resultIdentifier: "EK-1")
+        #expect(throws: OperationTransitionError.self) {
+            try store.recordResultIdentifier("EK-2", for: op.id)
+        }
+    }
+
     @Test("An idempotency key is unique and its recorded outcome is replayable")
     func idempotency() throws {
         let store = try store()

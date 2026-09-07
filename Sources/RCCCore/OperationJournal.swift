@@ -190,6 +190,24 @@ extension Store {
         try transition(id, to: .executing, from: [.prepared], sets: [:])
     }
 
+    /// Record the affected item's identifier while the row is still `executing`, right
+    /// after the EventKit call returns it and *before* `markSucceeded`. This is what makes
+    /// a crash in the gap between "EventKit saved" and "journal updated" recoverable to
+    /// `succeeded` rather than `outcome_unknown` (SPEC §9.6). Does not change state.
+    public func recordResultIdentifier(_ identifier: String, for id: String) throws {
+        try run(
+            """
+            UPDATE operation_journal
+            SET result_identifier = ?, updated_at = ?
+            WHERE id = ? AND state = 'executing';
+            """,
+            [.text(identifier), .text(RCCTime.instant()), .text(id)]
+        )
+        guard changes() == 1 else {
+            throw OperationTransitionError(id: id, attempted: "record result_identifier")
+        }
+    }
+
     /// executing → succeeded, recording the affected item's identifier.
     public func markSucceeded(_ id: String, resultIdentifier: String?, detail: String? = nil) throws {
         try transition(id, to: .succeeded, from: [.executing], sets: [
@@ -232,6 +250,15 @@ extension Store {
     public func operationsInFlight() throws -> [OperationRecord] {
         try queryAll(
             Self.operationSelect + " WHERE state = 'executing' ORDER BY prepared_at;",
+            [], Self.decodeOperation
+        )
+    }
+
+    /// Rows that never left `prepared`: the process died before the write began, so
+    /// EventKit was never touched. Reconciliation fails these outright.
+    public func operationsPrepared() throws -> [OperationRecord] {
+        try queryAll(
+            Self.operationSelect + " WHERE state = 'prepared' ORDER BY prepared_at;",
             [], Self.decodeOperation
         )
     }

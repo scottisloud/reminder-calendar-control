@@ -277,8 +277,9 @@ check_exit "an unknown subcommand" 2 "$RCC" no-such-subcommand
 # ---------------------------------------------------------------------------
 log 'Summary'
 if [ "$FAILURES" -eq 0 ]; then
-  printf '  Milestone 1a PASSED — all three launch contexts read and wrote the dev fixtures.\n'
-  printf '  Milestone 1b (Developer ID + notarization) is still outstanding; see docs/milestone-1.md.\n'
+  printf '  Milestone 1 PASSED — all three launch contexts read and wrote the dev fixtures,\n'
+  printf '  and rcc doctor is healthy. Run against a Developer-ID-signed, entitled, notarized\n'
+  printf '  build for the full M1b gate; see docs/milestone-1b-findings.md.\n'
   printf '  Results: %s\n' "$RESULTS_DIR"
   exit 0
 fi

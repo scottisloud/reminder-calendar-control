@@ -1,5 +1,15 @@
 # Milestone 1 — Platform & packaging proof
 
+> **Status: DONE.** This document records the M1a investigation and its two open
+> blockers. Both are now resolved — see [`milestone-1b-findings.md`](milestone-1b-findings.md).
+> The root cause was *not* the ad-hoc signature: it needed the
+> `com.apple.security.personal-information.*` entitlements (macOS 26.5 gates the prompt on
+> them) and a foreground `NSApplication` for the request, plus a `read(2)` fix for a stdin
+> hang. Proven end to end against a Developer-ID-signed, entitled, notarized binary with
+> `rcc setup` and `rcc serve` both run through Claude Desktop's own disclaimer shim.
+> Sections below are kept as written for the record; §1's "gated on a purchase" framing is
+> superseded.
+
 SPEC §18, Milestone 1:
 
 > **Platform & packaging proof** — self-disclaim mechanism with its one-time guard (§6.2),

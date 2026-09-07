@@ -8,10 +8,20 @@ Personal-use, single-machine, macOS 26+. See [SPEC.md](SPEC.md) for the full des
 
 ## Status
 
-**Milestone 1 of 7 — platform & packaging proof — DONE.**
+**Milestones 1 and 2 of 7 done.** Next: Milestone 3 — the read path.
 
-Claude Desktop can talk to `rcc` end to end: a Desktop-spawned `rcc serve` has full
-Calendar and Reminders access and passes its platform self-test.
+**M1 — platform & packaging proof.** Claude Desktop can talk to `rcc` end to end: a
+Desktop-spawned `rcc serve` has full Calendar and Reminders access and passes its platform
+self-test.
+
+**M2 — core model & mutation journal.** Schema v2 adds the operation journal (a
+crash-safe `prepared → executing → succeeded|failed`, `executing → outcome_unknown`
+state machine), opaque server-issued locators with generation invalidation, idempotency
+keys with replay, a `RecurrenceRule` DTO that round-trips through EventKit, and
+`ContentVersion`/`if_match` for optimistic concurrency. `Reconciler.run()` recovers every
+mid-flight operation on startup — verified against a fault injected at every journal
+transition. 169 tests, none touching EventKit or Claude Desktop. The `if_match` /
+recurrence-scope / locator *enforcement* wiring lands with M3's read/write path.
 
 Built: the embedded `Info.plist` + Hardened Runtime + `personal-information` entitlements
 signing profile, notarization, one authoritative install path, the TCC self-disclaim

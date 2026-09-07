@@ -48,13 +48,21 @@ public enum Disclaim {
         /// A generation above 1 was observed — the guard leaked, or a caller forged a
         /// pid-matching sentinel. Treated as untrusted, same as `notDisclaimed`.
         case guardViolated
+        /// DIAGNOSTIC ONLY (milestone-1b): the disclaim was deliberately skipped because
+        /// `RCC_DISCLAIM=0` was set in the environment. Used to test whether a properly
+        /// signed `rcc` still needs the disclaim at all on macOS 26. Not a production path.
+        case bypassed
 
-        public var isHealthy: Bool { self == .disclaimed }
+        public var isHealthy: Bool { self == .disclaimed || self == .bypassed }
 
         public var remediation: String? {
             switch self {
             case .disclaimed:
                 return nil
+            case .bypassed:
+                return "DIAGNOSTIC BUILD: the self-disclaim was skipped (RCC_DISCLAIM=0). "
+                    + "TCC attribution falls to whatever launched rcc. Unset RCC_DISCLAIM for "
+                    + "normal behaviour."
             case .mechanismRejected:
                 return "responsibility_spawnattrs_setdisclaim is present on this system but rejected "
                     + "the request. This is not the symbol having been removed; something about the "
@@ -123,6 +131,21 @@ public enum Disclaim {
     @discardableResult
     public static func ensure() -> Result {
         if let result { return result }
+
+        // DIAGNOSTIC (milestone-1b): RCC_DISCLAIM=0 skips the disclaim entirely so we can
+        // test whether a properly signed rcc still needs it on macOS 26. Loud on stderr so
+        // it can never be mistaken for normal operation.
+        if ProcessInfo.processInfo.environment["RCC_DISCLAIM"] == "0" {
+            let pid = getpid()
+            let warning = "RCC_DISCLAIM=0 — self-disclaim SKIPPED (diagnostic build). "
+                + "TCC attribution falls to the launching process.\n"
+            warning.withCString { _ = write(STDERR_FILENO, $0, strlen($0)) }
+            return finish(Result(
+                outcome: .bypassed, generation: 0,
+                responsiblePID: rcc_responsible_pid(pid), pid: pid,
+                mechanismAvailable: rcc_disclaim_available() == 1, spawnErrno: nil
+            ))
+        }
 
         let pid = getpid()
         let generation = readGeneration(for: pid)

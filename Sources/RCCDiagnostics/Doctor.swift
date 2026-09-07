@@ -71,9 +71,13 @@ public struct Doctor: Sendable {
             "mechanism_available": result.mechanismAvailable ? "true" : "false",
         ]
 
-        let status: HealthReport.Status = result.outcome.isHealthy ? .ok : .fail
+        let status: HealthReport.Status = result.outcome == .bypassed
+            ? .warn
+            : (result.outcome.isHealthy ? .ok : .fail)
         let detail: String
-        if result.outcome.isHealthy {
+        if result.outcome == .bypassed {
+            detail = "BYPASSED via RCC_DISCLAIM=0 — diagnostic build, not a production path"
+        } else if result.outcome.isHealthy {
             detail = "re-executed once; TCC holds rcc responsible for itself (pid \(result.pid))"
         } else {
             detail = "\(result.outcome.rawValue) — TCC holds pid \(result.responsiblePID) responsible, not rcc"

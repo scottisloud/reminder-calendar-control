@@ -8,6 +8,9 @@
 # Options:
 #   --identifier <id>       Signing identifier. Default: CFBundleIdentifier from the
 #                           embedded __TEXT,__info_plist, else the filename.
+#   --entitlements <path>   Entitlements plist to seal in. Default: RCC_ENTITLEMENTS, else
+#                           Resources/rcc-Entitlements.plist beside this repo. Pass "none"
+#                           to sign with no entitlements.
 #   --notarize              Submit to Apple's notary service and attempt to staple.
 #   --allow-adhoc           Permit ad-hoc (`-s -`) signing. Never notarizable.
 #   --keychain-profile <p>  notarytool keychain profile. Default: $RCC_NOTARY_PROFILE.
@@ -17,12 +20,13 @@
 #   RCC_SIGN_IDENTITY   Signing identity. If unset, a unique "Developer ID Application"
 #                       identity is auto-detected.
 #   RCC_NOTARY_PROFILE  Default notarytool keychain profile name.
+#   RCC_ENTITLEMENTS    Default entitlements plist path.
 #
-# No entitlements are supplied, deliberately. Hardened Runtime requires none, and the
-# posix_spawn(POSIX_SPAWN_SETEXEC) self-disclaim works under it with none. Adding
-# `com.apple.security.app-sandbox: false` "for clarity" is a runtime no-op that changes the
-# cdhash — and therefore costs a TCC re-prompt — for nothing. Setting it *true* kills a bare
-# CLI with SIGTRAP before main().
+# Entitlements: rcc ships `com.apple.security.personal-information.{calendars,reminders}`.
+# macOS 26.5 will not present a Calendar/Reminders TCC prompt for a Hardened-Runtime binary
+# that lacks them (see docs/milestone-1b-findings.md). They are unrestricted keys — no
+# provisioning profile, no App Sandbox. Do NOT add `com.apple.security.app-sandbox`: true
+# kills a bare CLI with SIGTRAP before main(); false is a cdhash-churning no-op.
 set -euo pipefail
 
 readonly PROG="${0##*/}"
@@ -33,15 +37,19 @@ die()  { printf '[%s] ERROR: %s\n' "$PROG" "$*" >&2; exit 1; }
 # so `--help` can never leak code (it used to end with `set -euo pipefail`).
 usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 BINARY=""
 IDENTIFIER=""
 NOTARIZE=0
 ALLOW_ADHOC=0
 KEYCHAIN_PROFILE="${RCC_NOTARY_PROFILE:-}"
+ENTITLEMENTS="${RCC_ENTITLEMENTS:-$SCRIPT_DIR/../Resources/rcc-Entitlements.plist}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --identifier)       [ $# -ge 2 ] || die "--identifier needs a value";       IDENTIFIER="$2";       shift 2 ;;
+    --entitlements)     [ $# -ge 2 ] || die "--entitlements needs a value";      ENTITLEMENTS="$2";     shift 2 ;;
     --keychain-profile) [ $# -ge 2 ] || die "--keychain-profile needs a value"; KEYCHAIN_PROFILE="$2"; shift 2 ;;
     --notarize)    NOTARIZE=1;    shift ;;
     --allow-adhoc) ALLOW_ADHOC=1; shift ;;
@@ -122,24 +130,50 @@ fi
 # two identities are independent and can silently diverge; pinning removes the possibility.
 sign_args=(--sign "$IDENTITY" --force --options runtime --identifier "$IDENTIFIER")
 
+# Seal in the entitlements unless the caller opted out with `--entitlements none`.
+WANT_ENTITLEMENTS=1
+case "$ENTITLEMENTS" in
+  none|"") WANT_ENTITLEMENTS=0 ;;
+  *)
+    [ -f "$ENTITLEMENTS" ] || die "entitlements file not found: $ENTITLEMENTS (pass --entitlements none to sign without)"
+    plutil -lint "$ENTITLEMENTS" >/dev/null || die "entitlements plist is malformed: $ENTITLEMENTS"
+    sign_args+=(--entitlements "$ENTITLEMENTS")
+    ;;
+esac
+
 # `--timestamp` is silently accepted with `-s -` and produces no timestamp at all.
 if [ "$ADHOC" -eq 1 ]; then sign_args+=(--timestamp=none); else sign_args+=(--timestamp); fi
 
 log "signing $BINARY as '$IDENTIFIER' with identity: $IDENTITY"
+[ "$WANT_ENTITLEMENTS" -eq 1 ] && log "entitlements: $ENTITLEMENTS"
 codesign "${sign_args[@]}" "$BINARY"
 
 log "verifying"
 codesign --verify --strict --verbose=2 "$BINARY"
-codesign --display --verbose=4 "$BINARY" 2>&1 | sed 's/^/    /' >&2
 codesign --display --requirements - "$BINARY" 2>&1 | sed 's/^/    /' >&2
+
+# Capture the display block ONCE. Re-running `codesign -dvvv 2>&1 | grep` per check races
+# under load (concurrent notarization, rapid rebuilds) and intermittently reports a false
+# negative on a correctly signed binary.
+DISPLAY_INFO="$(codesign --display --verbose=4 "$BINARY" 2>&1)"
+printf '%s\n' "$DISPLAY_INFO" | sed 's/^/    /' >&2
 
 # Guard against shipping SwiftPM's raw output, which is linker-signed with
 # flags=0x20002(adhoc,linker-signed), Identifier=<filename>, and Info.plist=not bound.
-if codesign -dvvv "$BINARY" 2>&1 | grep -q 'linker-signed'; then
-  die "still linker-signed — the codesign call above did not take effect"
-fi
-if ! codesign -dvvv "$BINARY" 2>&1 | grep -q '^Info.plist entries='; then
-  die "Info.plist is not sealed into the signature"
+printf '%s\n' "$DISPLAY_INFO" | grep -q 'linker-signed' \
+  && die "still linker-signed — the codesign call above did not take effect"
+printf '%s\n' "$DISPLAY_INFO" | grep -q '^Info.plist entries=' \
+  || die "Info.plist is not sealed into the signature"
+
+# The whole reason this file exists (docs/milestone-1b-findings.md): without these keys,
+# macOS 26.5 will not present a Calendar/Reminders prompt for a Hardened-Runtime binary.
+if [ "$WANT_ENTITLEMENTS" -eq 1 ]; then
+  ENT_DUMP="$(codesign --display --entitlements - --xml "$BINARY" 2>/dev/null | plutil -convert xml1 -o - - 2>/dev/null || true)"
+  for key in com.apple.security.personal-information.calendars com.apple.security.personal-information.reminders; do
+    printf '%s\n' "$ENT_DUMP" | grep -q "$key" \
+      || die "signed binary is missing the entitlement $key — the seal did not take"
+  done
+  log "entitlements sealed: personal-information.calendars + .reminders"
 fi
 
 if [ "$ADHOC" -eq 0 ]; then

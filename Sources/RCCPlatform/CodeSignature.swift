@@ -85,28 +85,45 @@ public struct CodeSignature: Sendable, Equatable {
         return commonName as String?
     }
 
-    /// Gatekeeper's verdict, which is the practical proxy for "is this notarised".
+    /// Whether the binary satisfies the `notarized` code requirement.
     ///
-    /// Shelled out to `spctl` rather than using `SecAssessment`, whose useful modes
-    /// require privileges `rcc` has no business holding.
+    /// NOT `spctl -a -t exec`: on a bare Mach-O (which `rcc` is) that always reports
+    /// "the code is valid but does not seem to be an app" and exits non-zero even when the
+    /// binary is fully notarised — it only accepts `.app`/`.pkg`/`.dmg`. `codesign
+    /// -R=notarized` checks the actual notarisation ticket (online, since a flat Mach-O
+    /// cannot be stapled) and is the right probe for this artifact shape.
     public static func gatekeeperAssessment(path: String) -> (accepted: Bool, detail: String) {
+        let (status, output) = run(
+            "/usr/bin/codesign",
+            ["--verify", "--strict", "-R=notarized", "--verbose=1", path]
+        )
+        if status == 0 {
+            return (true, "codesign -R=notarized: satisfied")
+        }
+        // Fall back to spctl's text purely for a human-readable reason in `facts`.
+        let (_, spctlOutput) = run("/usr/sbin/spctl", ["-a", "-vvv", "-t", "exec", path])
+        let reason = spctlOutput.isEmpty ? output : spctlOutput
+        return (false, "not notarized (\(reason.isEmpty ? "no detail" : reason))")
+    }
+
+    private static func run(_ tool: String, _ arguments: [String]) -> (status: Int32, output: String) {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/spctl")
-        process.arguments = ["-a", "-vvv", "-t", "exec", path]
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = arguments
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
         do {
             try process.run()
         } catch {
-            return (false, "could not run spctl: \(error.localizedDescription)")
+            return (-1, "could not run \(tool): \(error.localizedDescription)")
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         let output = (String(data: data, encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\n", with: "; ")
-        return (process.terminationStatus == 0, output.isEmpty ? "no output" : output)
+        return (process.terminationStatus, output)
     }
 
     public var facts: [String: String] {

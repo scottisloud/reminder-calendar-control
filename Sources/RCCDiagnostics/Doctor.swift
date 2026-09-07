@@ -71,9 +71,13 @@ public struct Doctor: Sendable {
             "mechanism_available": result.mechanismAvailable ? "true" : "false",
         ]
 
-        let status: HealthReport.Status = result.outcome.isHealthy ? .ok : .fail
+        let status: HealthReport.Status = result.outcome == .bypassed
+            ? .warn
+            : (result.outcome.isHealthy ? .ok : .fail)
         let detail: String
-        if result.outcome.isHealthy {
+        if result.outcome == .bypassed {
+            detail = "BYPASSED via RCC_DISCLAIM=0 — diagnostic build, not a production path"
+        } else if result.outcome.isHealthy {
             detail = "re-executed once; TCC holds rcc responsible for itself (pid \(result.pid))"
         } else {
             detail = "\(result.outcome.rawValue) — TCC holds pid \(result.responsiblePID) responsible, not rcc"
@@ -284,15 +288,15 @@ public struct Doctor: Sendable {
         let (accepted, detail) = CodeSignature.gatekeeperAssessment(path: path)
         return HealthReport.Check(
             id: "gatekeeper",
-            title: "Gatekeeper / notarization",
+            title: "Notarization",
             status: accepted ? .ok : .warn,
-            detail: accepted ? "accepted" : "rejected",
+            detail: accepted ? "notarized" : "not notarized",
             remediation: accepted
                 ? nil
-                : "Expected for a locally built, un-notarized binary; it still runs because it was never "
-                    + "quarantined. SPEC §18's Milestone 1 gate wants a notarized artifact, which needs a "
-                    + "Developer ID certificate. See docs/milestone-1.md.",
-            facts: ["spctl": detail, "path": path]
+                : "A locally built binary runs fine (never quarantined), but notarization is "
+                    + "part of the known-good macOS 26 recipe for TCC prompts to appear. Ship "
+                    + "with Scripts/build-release.sh --notarize. See docs/milestone-1b-findings.md.",
+            facts: ["probe": detail, "path": path]
         )
     }
 

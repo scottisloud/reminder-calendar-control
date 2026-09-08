@@ -29,10 +29,20 @@ public protocol CalendarRepository: Sendable {
 
     func createEvent(_ draft: EventDraft) async throws -> String
     func events(inCalendar calendarIdentifier: String, from: Date, to: Date) async throws -> [EventSummary]
+    /// Events across the given calendars (or every event calendar when `nil`) in a bounded
+    /// window. A window longer than four years is walked in ≤4-year chunks — EventKit's
+    /// predicate silently truncates one otherwise (SPEC §9.4/§10).
+    func listEvents(calendarIdentifiers: [String]?, from: Date, to: Date) async throws -> [EventSummary]
+    func event(withIdentifier identifier: String) async throws -> EventSummary?
     func deleteEvent(identifier: String) async throws
 
     func createReminder(_ draft: ReminderDraft) async throws -> String
     func reminders(inCalendar calendarIdentifier: String) async throws -> [ReminderSummary]
+    /// Reminders matching a filter, across lists. Its own query contract, not the events'
+    /// one: most reminders have no due date, so a range is optional and, when given,
+    /// undated reminders are still included unless excluded explicitly (SPEC §10).
+    func listReminders(_ filter: ReminderFilter) async throws -> [ReminderSummary]
+    func reminder(withIdentifier identifier: String) async throws -> ReminderSummary?
     func deleteReminder(identifier: String) async throws
 
     /// Whether an item with this identifier currently resolves. Crash recovery (SPEC §9.6)
@@ -269,6 +279,51 @@ public struct EventSummary: Sendable, Equatable, Identifiable {
             ("alarms", alarms.map { "\($0.type.name):\($0.relativeOffset ?? 0)" }.sorted().joined(separator: ",")),
             ("calendar", calendarIdentifier),
         ]
+    }
+}
+
+/// Filter for `list_reminders` / `search_reminders` (SPEC §10).
+public struct ReminderFilter: Sendable, Equatable {
+    public enum Completion: String, Sendable, CaseIterable { case any, incomplete, completed }
+
+    public var calendarIdentifiers: [String]?
+    public var completion: Completion
+    /// Completion-date lower/upper bound, applied only to completed reminders.
+    public var completedFrom: Date?
+    public var completedTo: Date?
+    /// Due/start component range. `nil` bounds are open. When a bound is set, undated
+    /// reminders are still returned unless `includeUndated` is false.
+    public var dueFrom: Date?
+    public var dueTo: Date?
+    public var includeUndated: Bool
+    /// Free-text match over title (and, when the caller opts in, notes).
+    public var text: String?
+    public var searchNotes: Bool
+    /// Keep only reminders whose priority bucket is at least this (`high` > `medium` > `low`).
+    public var minimumPriorityBucket: ReminderPriorityBucket?
+
+    public init(
+        calendarIdentifiers: [String]? = nil,
+        completion: Completion = .any,
+        completedFrom: Date? = nil,
+        completedTo: Date? = nil,
+        dueFrom: Date? = nil,
+        dueTo: Date? = nil,
+        includeUndated: Bool = true,
+        text: String? = nil,
+        searchNotes: Bool = false,
+        minimumPriorityBucket: ReminderPriorityBucket? = nil
+    ) {
+        self.calendarIdentifiers = calendarIdentifiers
+        self.completion = completion
+        self.completedFrom = completedFrom
+        self.completedTo = completedTo
+        self.dueFrom = dueFrom
+        self.dueTo = dueTo
+        self.includeUndated = includeUndated
+        self.text = text
+        self.searchNotes = searchNotes
+        self.minimumPriorityBucket = minimumPriorityBucket
     }
 }
 

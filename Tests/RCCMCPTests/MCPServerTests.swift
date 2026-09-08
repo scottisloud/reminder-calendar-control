@@ -115,12 +115,16 @@ struct MCPServerTests {
     @Test("Every advertised tool has a name, a description, and an object input schema")
     func toolDescriptorShape() throws {
         let tools = Tools.descriptors
-        #expect(tools.count == 2)
+        #expect(tools.count == 2 + ReadTools.names.count)
+        var names = Set<String>()
         for tool in tools {
-            #expect((tool["name"] as? String)?.isEmpty == false)
+            let name = try #require(tool["name"] as? String)
+            #expect(!name.isEmpty)
+            #expect(names.insert(name).inserted, "duplicate descriptor \(name)")
             #expect((tool["description"] as? String)?.isEmpty == false)
             let schema = try #require(tool["inputSchema"] as? [String: Any])
             #expect(schema["type"] as? String == "object")
+            #expect(schema["additionalProperties"] as? Bool == false)
         }
         #expect(JSONSerialization.isValidJSONObject(["tools": tools]))
     }
@@ -128,19 +132,18 @@ struct MCPServerTests {
     /// `readOnlyHint: true` is not decoration — it is the only annotation Claude Desktop
     /// forwards, and it exempts a tool from the approval policy. Marking a mutating tool
     /// read-only would be a real security bug.
-    @Test("Only the genuinely read-only tool claims to be read-only")
+    @Test("Only genuinely read-only tools claim to be read-only")
     func readOnlyHintIsHonest() throws {
+        // The only tool that writes anything.
+        let mutating: Set<String> = [Tools.runPlatformSelfTest]
         for tool in Tools.descriptors {
             let name = try #require(tool["name"] as? String)
             let annotations = try #require(tool["annotations"] as? [String: Any])
-            let readOnly = annotations["readOnlyHint"] as? Bool
-            switch name {
-            case Tools.getSystemStatus:
-                #expect(readOnly == true)
-            case Tools.runPlatformSelfTest:
-                #expect(readOnly == false)
-            default:
-                Issue.record("unexpected tool \(name)")
+            let readOnly = annotations["readOnlyHint"] as? Bool ?? false
+            if mutating.contains(name) {
+                #expect(readOnly == false, "\(name) writes but claims readOnlyHint")
+            } else {
+                #expect(readOnly == true, "\(name) is read-only but does not claim it")
             }
             // EventKit is a closed local domain; nothing here reaches the network.
             #expect(annotations["openWorldHint"] as? Bool == false)
@@ -154,8 +157,8 @@ struct MCPServerTests {
             #"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#, to: server
         ))
         let tools = try #require((response["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        #expect(tools.map { $0["name"] as? String }.sorted { ($0 ?? "") < ($1 ?? "") }
-            == [Tools.getSystemStatus, Tools.runPlatformSelfTest].sorted())
+        let names = Set(tools.compactMap { $0["name"] as? String })
+        #expect(names == ReadTools.names.union([Tools.getSystemStatus, Tools.runPlatformSelfTest]))
     }
 
     @Test("Structured content is mirrored into a text block")

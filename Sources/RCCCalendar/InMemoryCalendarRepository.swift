@@ -161,6 +161,24 @@ public actor InMemoryCalendarRepository: CalendarRepository {
             .sorted { $0.start < $1.start }
     }
 
+    public func listEvents(
+        calendarIdentifiers: [String]?, from: Date, to: Date
+    ) async throws -> [EventSummary] {
+        try requireAccess(.event)
+        let allowed = calendarIdentifiers.map(Set.init)
+        return storedEvents.values
+            .filter { event in
+                (allowed?.contains(event.calendarIdentifier) ?? true)
+                    && event.end > from && event.start < to
+            }
+            .sorted { ($0.start, $0.id) < ($1.start, $1.id) }
+    }
+
+    public func event(withIdentifier identifier: String) async throws -> EventSummary? {
+        try requireAccess(.event)
+        return storedEvents[identifier]
+    }
+
     public func deleteEvent(identifier: String) async throws {
         try requireAccess(.event)
         try consumeInjectedFailure()
@@ -193,6 +211,41 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         return storedReminders.values
             .filter { $0.calendarIdentifier == calendarIdentifier }
             .sorted { $0.id < $1.id }
+    }
+
+    public func listReminders(_ filter: ReminderFilter) async throws -> [ReminderSummary] {
+        try requireAccess(.reminder)
+        let allowed = filter.calendarIdentifiers.map(Set.init)
+        return storedReminders.values
+            .filter { reminder in
+                if let allowed, !allowed.contains(reminder.calendarIdentifier) { return false }
+                switch filter.completion {
+                case .any: break
+                case .incomplete: if reminder.isCompleted { return false }
+                case .completed: if !reminder.isCompleted { return false }
+                }
+                if let text = filter.text, !text.isEmpty {
+                    let haystack = filter.searchNotes
+                        ? "\(reminder.title)\n\(reminder.notes ?? "")"
+                        : reminder.title
+                    if !haystack.localizedCaseInsensitiveContains(text) { return false }
+                }
+                if let minimum = filter.minimumPriorityBucket,
+                   ReminderPriorityBucket(raw: reminder.priorityRaw).rank < minimum.rank {
+                    return false
+                }
+                // The fake never sets due dates, so every reminder here is undated.
+                if (filter.dueFrom != nil || filter.dueTo != nil), !filter.includeUndated {
+                    return false
+                }
+                return true
+            }
+            .sorted { ($0.title, $0.id) < ($1.title, $1.id) }
+    }
+
+    public func reminder(withIdentifier identifier: String) async throws -> ReminderSummary? {
+        try requireAccess(.reminder)
+        return storedReminders[identifier]
     }
 
     public func deleteReminder(identifier: String) async throws {

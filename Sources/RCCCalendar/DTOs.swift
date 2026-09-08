@@ -140,8 +140,8 @@ extension DateComponentsDTO {
 
 /// The reminder priority bucket EventKit's 0–9 scale maps to (SPEC §9.2).
 /// 1–4 high, 5 medium, 6–9 low, 0 none. The raw value is always retained alongside.
-public enum ReminderPriorityBucket: String, Sendable {
-    case none, high, medium, low
+public enum ReminderPriorityBucket: String, Sendable, Equatable, CaseIterable {
+    case none, low, medium, high
 
     public init(raw: Int) {
         switch raw {
@@ -149,6 +149,16 @@ public enum ReminderPriorityBucket: String, Sendable {
         case 5: self = .medium
         case 6...9: self = .low
         default: self = .none
+        }
+    }
+
+    /// `high` > `medium` > `low` > `none`, for "at least this priority" filters.
+    public var rank: Int {
+        switch self {
+        case .none: return 0
+        case .low: return 1
+        case .medium: return 2
+        case .high: return 3
         }
     }
 }

@@ -371,6 +371,26 @@ public actor EventKitRepository: CalendarRepository {
         }
     }
 
+    /// Observe `EKEventStoreChanged` (SPEC §7.4).
+    ///
+    /// `object: nil` and `queue: nil`: the notification is delivered by `EKEventStore`'s
+    /// own XPC connection on an internal queue, so it does not need the main run loop
+    /// turning, and the block runs synchronously on that queue. `onChange` must therefore
+    /// be thread-safe — the caller uses it only to bump a `FULLMUTEX` SQLite counter.
+    /// Deliberately NOT the typed `EKEventStore.EventStoreChanged` API, which SIGTRAPs when
+    /// the notification is posted off the main thread (docs/milestone-1.md §5.7).
+    ///
+    /// This does not recreate the store: `rcc` keeps no TTL cache (§7.4), converts every
+    /// fetched object to a value immediately, and re-runs each predicate per request, so a
+    /// long-lived `EKEventStore` still sees another process's writes on the next fetch.
+    public nonisolated func observeStoreChanges(
+        _ onChange: @escaping @Sendable () -> Void
+    ) -> AnyObject? {
+        NotificationCenter.default.addObserver(
+            forName: .EKEventStoreChanged, object: nil, queue: nil
+        ) { _ in onChange() }
+    }
+
     // MARK: - Source selection
 
     /// Pick a source for a tool-owned calendar.

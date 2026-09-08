@@ -169,6 +169,41 @@ struct ReadToolsTests {
         }
     }
 
+    @Test("search_events requires a query and filters post-fetch")
+    func searchEvents() async throws {
+        let repo = try await seededRepository()
+        let window: [String: Any] = [
+            "from": "2023-11-14T00:00:00.000Z", "to": "2023-11-16T00:00:00.000Z",
+        ]
+
+        await #expect(throws: ToolError.self) {
+            _ = try await run(ReadTools.searchEvents, repo, args: window)
+        }
+
+        var args = window
+        args["text"] = "Meeting 3"
+        let hit = try await run(ReadTools.searchEvents, repo, args: args)
+        let data = try #require(hit["data"] as? [[String: Any]])
+        #expect(data.count == 1)
+        #expect(data[0]["title"] as? String == "Meeting 3")
+
+        // list_events with the same text works too, but without requiring it.
+        let viaList = try await run(ReadTools.listEvents, repo, args: args)
+        #expect((viaList["data"] as? [[String: Any]])?.count == 1)
+    }
+
+    @Test("search_reminders requires text")
+    func searchReminders() async throws {
+        let repo = try await seededRepository()
+        await #expect(throws: ToolError.self) {
+            _ = try await run(ReadTools.searchReminders, repo)
+        }
+        let hit = try await run(ReadTools.searchReminders, repo, args: ["text": "Task 2"])
+        let data = try #require(hit["data"] as? [[String: Any]])
+        #expect(data.count == 1)
+        #expect(data[0]["title"] as? String == "Task 2")
+    }
+
     @Test("A repository authorization failure maps to a permission code")
     func unauthorized() async throws {
         let repo = InMemoryCalendarRepository(scenario: .init(eventStatus: .denied))

@@ -50,6 +50,18 @@ public protocol CalendarRepository: Sendable {
     /// `false` rather than throwing when access is missing — the caller (`Reconciler`)
     /// checks authorization itself and does not probe at all when it is absent.
     func itemExists(identifier: String, entityType: RCCEntityType) async -> Bool
+
+    /// Register for external calendar/reminder changes (`EKEventStoreChanged`, SPEC §7.4).
+    /// `onChange` fires whenever another process (Calendar.app, a sync) mutates the store.
+    /// Returns a token the caller must retain; releasing it removes the observer. The
+    /// in-memory fake never fires (nothing external can change it).
+    @discardableResult
+    func observeStoreChanges(_ onChange: @escaping @Sendable () -> Void) -> AnyObject?
+}
+
+public extension CalendarRepository {
+    @discardableResult
+    func observeStoreChanges(_ onChange: @escaping @Sendable () -> Void) -> AnyObject? { nil }
 }
 
 public enum RCCEntityType: String, Sendable, CaseIterable {

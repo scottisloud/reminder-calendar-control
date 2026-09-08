@@ -17,13 +17,15 @@ public enum ReadTools {
     public static let listReminderLists = "list_reminder_lists"
     public static let listSources = "list_sources"
     public static let listEvents = "list_events"
+    public static let searchEvents = "search_events"
     public static let getEvent = "get_event"
     public static let listReminders = "list_reminders"
+    public static let searchReminders = "search_reminders"
     public static let getReminder = "get_reminder"
 
     public static let names: Set<String> = [
-        listCalendars, listReminderLists, listSources, listEvents, getEvent,
-        listReminders, getReminder,
+        listCalendars, listReminderLists, listSources, listEvents, searchEvents, getEvent,
+        listReminders, searchReminders, getReminder,
     ]
 
     // MARK: - Descriptors
@@ -49,6 +51,20 @@ public enum ReadTools {
             "cursor": ["type": "string", "description": "Opaque cursor from a previous page's `pagination.next_cursor`."],
             "include_details": ["type": "boolean", "description": "Return the full item shape instead of the compact list projection."],
         ]
+    }
+
+    private static func eventQueryProps() -> [String: Any] {
+        var props: [String: Any] = [
+            "from": ["type": "string", "description": "Window start, RFC 3339."],
+            "to": ["type": "string", "description": "Window end, RFC 3339."],
+            "calendar_ids": ["type": "array", "items": ["type": "string"],
+                             "description": "Restrict to these calendars; omit for all."],
+            "text": ["type": "string", "description": "Match against title and location."],
+            "search_notes": ["type": "boolean", "description": "Also match `text` against notes."],
+            "attendee": ["type": "string", "description": "Match a participant name, email, or URL."],
+        ]
+        for (key, value) in paginationProps() { props[key] = value }
+        return props
     }
 
     public static var descriptors: [[String: Any]] {
@@ -78,19 +94,22 @@ public enum ReadTools {
                 "description": """
                     List calendar events in a bounded time window. `from` and `to` are \
                     required RFC 3339 timestamps; a window over four years is walked in \
-                    chunks automatically. Results are a compact projection unless \
-                    `include_details` is set.
+                    chunks automatically. Optional `text` / `attendee` narrow the result \
+                    (post-fetch). Compact projection unless `include_details` is set.
                     """,
-                "inputSchema": schema([
-                    "from": ["type": "string", "description": "Window start, RFC 3339."],
-                    "to": ["type": "string", "description": "Window end, RFC 3339."],
-                    "calendar_ids": ["type": "array", "items": ["type": "string"],
-                                     "description": "Restrict to these calendars; omit for all."],
-                    "limit": paginationProps()["limit"] as Any,
-                    "cursor": paginationProps()["cursor"] as Any,
-                    "include_details": paginationProps()["include_details"] as Any,
-                ], required: ["from", "to"]),
+                "inputSchema": schema(eventQueryProps(), required: ["from", "to"]),
                 "annotations": readOnly("List Events"),
+            ],
+            [
+                "name": searchEvents,
+                "description": """
+                    Search calendar events by free text (`text`, matched against title, \
+                    location, and — with `search_notes` — notes) or by `attendee` (name, \
+                    email, or URL), within the required `from`/`to` window. One of `text` \
+                    or `attendee` is required.
+                    """,
+                "inputSchema": schema(eventQueryProps(), required: ["from", "to"]),
+                "annotations": readOnly("Search Events"),
             ],
             [
                 "name": getEvent,
@@ -127,6 +146,21 @@ public enum ReadTools {
                 "annotations": readOnly("List Reminders"),
             ],
             [
+                "name": searchReminders,
+                "description": "Search reminders by free text (`text`, + `search_notes`). Same filters as list_reminders; `text` is required.",
+                "inputSchema": schema([
+                    "text": ["type": "string"],
+                    "search_notes": ["type": "boolean"],
+                    "completion": ["type": "string", "enum": ["any", "incomplete", "completed"]],
+                    "calendar_ids": ["type": "array", "items": ["type": "string"]],
+                    "minimum_priority": ["type": "string", "enum": ["low", "medium", "high"]],
+                    "limit": paginationProps()["limit"] as Any,
+                    "cursor": paginationProps()["cursor"] as Any,
+                    "include_details": paginationProps()["include_details"] as Any,
+                ], required: ["text"]),
+                "annotations": readOnly("Search Reminders"),
+            ],
+            [
                 "name": getReminder,
                 "description": "Get one reminder by identifier, with full detail.",
                 "inputSchema": schema([
@@ -155,11 +189,15 @@ public enum ReadTools {
         case listReminderLists:
             return try await runListCalendars(arguments, repository, forcedEntity: .reminder)
         case listEvents:
-            return try await runListEvents(arguments, repository, generation)
+            return try await runListEvents(arguments, repository, generation, requireQuery: false)
+        case searchEvents:
+            return try await runListEvents(arguments, repository, generation, requireQuery: true)
         case getEvent:
             return try await runGetEvent(arguments, repository)
         case listReminders:
-            return try await runListReminders(arguments, repository, generation)
+            return try await runListReminders(arguments, repository, generation, requireQuery: false)
+        case searchReminders:
+            return try await runListReminders(arguments, repository, generation, requireQuery: true)
         case getReminder:
             return try await runGetReminder(arguments, repository)
         default:
@@ -194,7 +232,8 @@ public enum ReadTools {
     private static func runListEvents(
         _ arguments: [String: Any],
         _ repository: any CalendarRepository,
-        _ generation: Int
+        _ generation: Int,
+        requireQuery: Bool
     ) async throws -> [String: Any] {
         guard let from = date(arguments["from"]), let to = date(arguments["to"]) else {
             throw ToolError(code: "invalid_datetime", message: "`from` and `to` (RFC 3339) are required")
@@ -204,10 +243,35 @@ public enum ReadTools {
         }
         let calendarIDs = stringArray(arguments["calendar_ids"])
         let detail = bool(arguments["include_details"]) ?? false
+        let text = string(arguments["text"])
+        let searchNotes = bool(arguments["search_notes"]) ?? false
+        let attendee = string(arguments["attendee"])
+        if requireQuery, text == nil, attendee == nil {
+            throw ToolError(code: "invalid_datetime", message: "`search_events` needs `text` or `attendee`")
+        }
 
-        let all = try await mapRepositoryError {
+        var all = try await mapRepositoryError {
             try await repository.listEvents(calendarIdentifiers: calendarIDs, from: from, to: to)
         }
+        // Non-EventKit-native filters, applied before page construction so page semantics
+        // do not shift under a text filter (SPEC §10).
+        if let text {
+            all = all.filter { event in
+                var haystack = "\(event.title)\n\(event.location ?? "")"
+                if searchNotes { haystack += "\n\(event.notes ?? "")" }
+                return haystack.localizedCaseInsensitiveContains(text)
+            }
+        }
+        if let attendee {
+            all = all.filter { event in
+                (event.participants + [event.organizer].compactMap { $0 }).contains { participant in
+                    [participant.name, participant.email, participant.url]
+                        .compactMap { $0 }
+                        .contains { $0.localizedCaseInsensitiveContains(attendee) }
+                }
+            }
+        }
+
         let page = try paginate(all, arguments: arguments, generation: generation)
         return envelope(
             data: page.items.map { project(event: $0, detail: detail) },
@@ -232,8 +296,12 @@ public enum ReadTools {
     private static func runListReminders(
         _ arguments: [String: Any],
         _ repository: any CalendarRepository,
-        _ generation: Int
+        _ generation: Int,
+        requireQuery: Bool
     ) async throws -> [String: Any] {
+        if requireQuery, string(arguments["text"]) == nil {
+            throw ToolError(code: "invalid_datetime", message: "`search_reminders` needs `text`")
+        }
         var filter = ReminderFilter()
         filter.calendarIdentifiers = stringArray(arguments["calendar_ids"])
         if let raw = string(arguments["completion"]) {

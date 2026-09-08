@@ -51,6 +51,18 @@ public struct MCPServer: Sendable {
     public func run() async {
         ProtocolIO.activate()
         Log.shared.info("mcp.serving", ["version": .safe(BuildInfo.versionString)])
+
+        // When another process changes the calendar store, bump the locator generation so
+        // any page cursor issued beforehand is refused with `cursor_stale` on its next use
+        // (SPEC §7.4/§10). Held for the lifetime of `run()`; released on return.
+        let changeObserver = store.map { store in
+            repository.observeStoreChanges {
+                try? store.invalidateAllLocators()
+                Log.shared.info("mcp.store_changed", ["outcome": .safe("locators_invalidated")])
+            }
+        } ?? nil
+        defer { changeObserver.map(NotificationCenter.default.removeObserver) }
+
         await ProtocolIO.readFrames { line in
             if let reply = await response(for: line) {
                 ProtocolIO.send(reply)

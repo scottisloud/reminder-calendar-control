@@ -161,6 +161,37 @@ public actor InMemoryCalendarRepository: CalendarRepository {
             .sorted { $0.start < $1.start }
     }
 
+    public func updateEvent(
+        identifier: String, patch: EventPatch, scope: RecurrenceScope?
+    ) async throws -> EventSummary {
+        try requireAccess(.event)
+        try consumeInjectedFailure()
+        guard let current = storedEvents[identifier] else {
+            throw CalendarRepositoryError.notFound("event \(identifier)")
+        }
+        var event = EventSummary(
+            id: current.id,
+            title: patch.title.isChange ? (patch.title.resolved(from: current.title) ?? "") : current.title,
+            start: { if case .set(let value) = patch.start { return value } else { return current.start } }(),
+            end: { if case .set(let value) = patch.end { return value } else { return current.end } }(),
+            calendarIdentifier: current.calendarIdentifier
+        )
+        event.isAllDay = { if case .set(let value) = patch.isAllDay { return value } else { return current.isAllDay } }()
+        event.location = patch.location.resolved(from: current.location)
+        event.notes = patch.notes.resolved(from: current.notes)
+        event.url = patch.url.resolved(from: current.url)
+        event.timeZoneIdentifier = patch.timeZoneIdentifier.resolved(from: current.timeZoneIdentifier)
+        event.availability = { if case .set(let name) = patch.availability {
+            return EnumValue(name: name, raw: -1)
+        } else { return current.availability } }()
+        event.isRecurring = current.isRecurring
+        event.recurrenceRules = current.recurrenceRules
+        event.sourceIdentifier = current.sourceIdentifier
+        event.version = ContentVersion.make(event.contentFields)
+        storedEvents[identifier] = event
+        return event
+    }
+
     public func listEvents(
         calendarIdentifiers: [String]?, from: Date, to: Date
     ) async throws -> [EventSummary] {
@@ -211,6 +242,80 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         return storedReminders.values
             .filter { $0.calendarIdentifier == calendarIdentifier }
             .sorted { $0.id < $1.id }
+    }
+
+    public func updateReminder(
+        identifier: String, patch: ReminderPatch
+    ) async throws -> ReminderSummary {
+        try requireAccess(.reminder)
+        try consumeInjectedFailure()
+        guard let current = storedReminders[identifier] else {
+            throw CalendarRepositoryError.notFound("reminder \(identifier)")
+        }
+        var reminder = ReminderSummary(
+            id: current.id,
+            title: patch.title.isChange ? (patch.title.resolved(from: current.title) ?? "") : current.title,
+            isCompleted: current.isCompleted,
+            calendarIdentifier: current.calendarIdentifier
+        )
+        reminder.notes = patch.notes.resolved(from: current.notes)
+        reminder.url = patch.url.resolved(from: current.url)
+        reminder.location = patch.location.resolved(from: current.location)
+        reminder.timeZoneIdentifier = current.timeZoneIdentifier
+        if case .set(let value) = patch.priorityRaw {
+            reminder.priorityRaw = max(0, min(9, value))
+        } else {
+            reminder.priorityRaw = current.priorityRaw
+        }
+        reminder.priorityBucket = ReminderPriorityBucket(raw: reminder.priorityRaw).rawValue
+        reminder.dueDate = dateComponents(patch.dueDate, current: current.dueDate)
+        reminder.startDate = dateComponents(patch.startDate, current: current.startDate)
+        reminder.completionDate = current.completionDate
+        reminder.recurrenceRules = current.recurrenceRules
+        reminder.sourceIdentifier = current.sourceIdentifier
+        reminder.version = ContentVersion.make(reminder.contentFields)
+        storedReminders[identifier] = reminder
+        return reminder
+    }
+
+    private func dateComponents(
+        _ patch: FieldPatch<Date>, current: DateComponentsDTO?
+    ) -> DateComponentsDTO? {
+        switch patch {
+        case .unchanged: return current
+        case .clear: return nil
+        case .set(let date):
+            let parts = Calendar.current.dateComponents(
+                [.year, .month, .day, .hour, .minute, .second], from: date
+            )
+            return DateComponentsDTO(parts)
+        }
+    }
+
+    public func setReminderCompleted(
+        identifier: String, completed: Bool
+    ) async throws -> ReminderSummary {
+        try requireAccess(.reminder)
+        try consumeInjectedFailure()
+        guard let current = storedReminders[identifier] else {
+            throw CalendarRepositoryError.notFound("reminder \(identifier)")
+        }
+        var reminder = ReminderSummary(
+            id: current.id, title: current.title, isCompleted: completed,
+            calendarIdentifier: current.calendarIdentifier
+        )
+        reminder.notes = current.notes
+        reminder.url = current.url
+        reminder.location = current.location
+        reminder.dueDate = current.dueDate
+        reminder.priorityRaw = current.priorityRaw
+        reminder.priorityBucket = current.priorityBucket
+        reminder.recurrenceRules = current.recurrenceRules
+        reminder.sourceIdentifier = current.sourceIdentifier
+        reminder.completionDate = completed ? Date() : nil
+        reminder.version = ContentVersion.make(reminder.contentFields)
+        storedReminders[identifier] = reminder
+        return reminder
     }
 
     public func listReminders(_ filter: ReminderFilter) async throws -> [ReminderSummary] {
@@ -304,6 +409,20 @@ public actor InMemoryCalendarRepository: CalendarRepository {
 
     /// Test affordance: seed a calendar that is not writable, to exercise the guards.
     public func insert(calendar: CalendarSummary) { storedCalendars[calendar.id] = calendar }
+
+    /// Test affordance: seed an event (e.g. a recurring one) with a chosen identifier.
+    public func insert(event: EventSummary) {
+        var stored = event
+        stored.version = ContentVersion.make(stored.contentFields)
+        storedEvents[event.id] = stored
+    }
+
+    /// Test affordance: seed a reminder with a chosen identifier.
+    public func insert(reminder: ReminderSummary) {
+        var stored = reminder
+        stored.version = ContentVersion.make(stored.contentFields)
+        storedReminders[reminder.id] = stored
+    }
 }
 
 extension RCCAuthorizationStatus {

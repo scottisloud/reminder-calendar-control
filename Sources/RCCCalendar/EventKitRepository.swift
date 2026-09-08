@@ -167,6 +167,44 @@ public actor EventKitRepository: CalendarRepository {
         return store.events(matching: predicate).compactMap(Self.summarize(event:))
     }
 
+    public func updateEvent(
+        identifier: String, patch: EventPatch, scope: RecurrenceScope?
+    ) async throws -> EventSummary {
+        try requireFullAccess(.event)
+        guard let event = store.event(withIdentifier: identifier) else {
+            throw CalendarRepositoryError.notFound("event \(identifier)")
+        }
+        guard event.calendar?.allowsContentModifications == true, event.calendar?.isImmutable != true else {
+            throw CalendarRepositoryError.readOnly("event \(identifier)")
+        }
+
+        if case .set(let value) = patch.title { event.title = value }
+        if case .set(let value) = patch.start { event.startDate = value }
+        if case .set(let value) = patch.end { event.endDate = value }
+        if case .set(let value) = patch.isAllDay { event.isAllDay = value }
+        applyString(patch.location, to: { event.location = $0 })
+        applyString(patch.notes, to: { event.notes = $0 })
+        applyURL(patch.url, to: { event.url = $0 })
+        if case .set(let identifier) = patch.timeZoneIdentifier {
+            event.timeZone = TimeZone(identifier: identifier)
+        } else if case .clear = patch.timeZoneIdentifier {
+            event.timeZone = nil
+        }
+        if case .set(let name) = patch.availability {
+            event.availability = Self.availability(named: name) ?? event.availability
+        }
+
+        do {
+            try store.save(event, span: scope?.ekSpan ?? .thisEvent, commit: true)
+        } catch {
+            throw CalendarRepositoryError.native("updating event \(identifier)", underlying: error as NSError)
+        }
+        guard let saved = store.event(withIdentifier: identifier).flatMap(Self.summarize(event:)) else {
+            throw CalendarRepositoryError.unsupported("event saved but no longer resolves by identifier")
+        }
+        return saved
+    }
+
     public func listEvents(
         calendarIdentifiers: [String]?, from: Date, to: Date
     ) async throws -> [EventSummary] {
@@ -248,6 +286,54 @@ public actor EventKitRepository: CalendarRepository {
                 continuation.resume(returning: (reminders ?? []).map(Self.summarize(reminder:)))
             }
         }
+    }
+
+    public func updateReminder(
+        identifier: String, patch: ReminderPatch
+    ) async throws -> ReminderSummary {
+        try requireFullAccess(.reminder)
+        guard let reminder = store.calendarItem(withIdentifier: identifier) as? EKReminder else {
+            throw CalendarRepositoryError.notFound("reminder \(identifier)")
+        }
+        guard reminder.calendar?.allowsContentModifications == true else {
+            throw CalendarRepositoryError.readOnly("reminder \(identifier)")
+        }
+
+        if case .set(let value) = patch.title { reminder.title = value }
+        applyString(patch.notes, to: { reminder.notes = $0 })
+        applyURL(patch.url, to: { reminder.url = $0 })
+        applyString(patch.location, to: { reminder.location = $0 })
+        if case .set(let value) = patch.priorityRaw {
+            reminder.priority = max(0, min(9, value))
+        }
+        applyDateComponents(patch.dueDate, zone: reminder.timeZone, to: { reminder.dueDateComponents = $0 })
+        applyDateComponents(patch.startDate, zone: reminder.timeZone, to: { reminder.startDateComponents = $0 })
+
+        do {
+            try store.save(reminder, commit: true)
+        } catch {
+            throw CalendarRepositoryError.native("updating reminder \(identifier)", underlying: error as NSError)
+        }
+        return Self.summarize(reminder: reminder)
+    }
+
+    public func setReminderCompleted(
+        identifier: String, completed: Bool
+    ) async throws -> ReminderSummary {
+        try requireFullAccess(.reminder)
+        guard let reminder = store.calendarItem(withIdentifier: identifier) as? EKReminder else {
+            throw CalendarRepositoryError.notFound("reminder \(identifier)")
+        }
+        // Setting `isCompleted` makes EventKit manage `completionDate`; set it explicitly
+        // so an "uncomplete" clears the old date rather than leaving it.
+        reminder.isCompleted = completed
+        reminder.completionDate = completed ? Date() : nil
+        do {
+            try store.save(reminder, commit: true)
+        } catch {
+            throw CalendarRepositoryError.native("completing reminder \(identifier)", underlying: error as NSError)
+        }
+        return Self.summarize(reminder: reminder)
     }
 
     public func listReminders(_ filter: ReminderFilter) async throws -> [ReminderSummary] {
@@ -438,6 +524,52 @@ public actor EventKitRepository: CalendarRepository {
         let status = Self.map(EKEventStore.authorizationStatus(for: entityType.ekEntityType))
         guard status.grantsFullAccess else {
             throw CalendarRepositoryError.notAuthorized(entityType, status)
+        }
+    }
+
+    // MARK: - Patch application
+
+    private func applyString(_ patch: FieldPatch<String>, to setter: (String?) -> Void) {
+        switch patch {
+        case .unchanged: break
+        case .set(let value): setter(value)
+        case .clear: setter(nil)
+        }
+    }
+
+    private func applyURL(_ patch: FieldPatch<String>, to setter: (URL?) -> Void) {
+        switch patch {
+        case .unchanged: break
+        case .set(let value): setter(URL(string: value))
+        case .clear: setter(nil)
+        }
+    }
+
+    private func applyDateComponents(
+        _ patch: FieldPatch<Date>, zone: TimeZone?, to setter: (DateComponents?) -> Void
+    ) {
+        switch patch {
+        case .unchanged: break
+        case .clear: setter(nil)
+        case .set(let date):
+            var calendar = Calendar.current
+            if let zone { calendar.timeZone = zone }
+            var components = calendar.dateComponents(
+                [.year, .month, .day, .hour, .minute, .second], from: date
+            )
+            components.timeZone = zone
+            setter(components)
+        }
+    }
+
+    static func availability(named name: String) -> EKEventAvailability? {
+        switch name.lowercased() {
+        case "busy": return .busy
+        case "free": return .free
+        case "tentative": return .tentative
+        case "unavailable": return .unavailable
+        case "notsupported": return .notSupported
+        default: return nil
         }
     }
 

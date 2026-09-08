@@ -93,32 +93,38 @@ public struct Reconciler: Sendable {
     }
 
     private func classify(_ op: OperationRecord, kind: OperationKind) async -> Verdict {
+        let noun = kind.isContainer ? "\(kind.entity.rawValue) list" : kind.entity.rawValue
+        func resolves(_ identifier: String) async -> Bool {
+            if kind.isContainer {
+                return await repository.calendarExists(identifier: identifier)
+            }
+            return await repository.itemExists(identifier: identifier, entityType: kind.entity)
+        }
+
         switch kind.verb {
         case .create:
             guard let identifier = op.resultIdentifier else {
                 return .unknown(detail:
-                    "no item identifier was recorded before the crash; cannot tell whether a "
-                    + "\(kind.entity.rawValue) was created")
+                    "no identifier was recorded before the crash; cannot tell whether a \(noun) was created")
             }
-            if await repository.itemExists(identifier: identifier, entityType: kind.entity) {
-                return .succeeded(identifier: identifier, detail: "reconciled: the created item resolves")
+            if await resolves(identifier) {
+                return .succeeded(identifier: identifier, detail: "reconciled: the created \(noun) resolves")
             }
             return .unknown(detail:
-                "recorded item \(identifier) no longer resolves — created then removed, or never committed")
+                "recorded \(noun) \(identifier) no longer resolves — created then removed, or never committed")
 
         case .delete:
             guard let identifier = op.resultIdentifier else {
                 return .unknown(detail: "no target identifier was recorded; the delete cannot be verified")
             }
-            if await repository.itemExists(identifier: identifier, entityType: kind.entity) {
+            if await resolves(identifier) {
                 return .unknown(detail:
                     "delete target \(identifier) still resolves — the remove may not have run; not retried")
             }
             return .succeeded(identifier: identifier, detail: "reconciled: the delete target no longer resolves")
 
         case .update:
-            if let identifier = op.resultIdentifier,
-               await repository.itemExists(identifier: identifier, entityType: kind.entity) {
+            if let identifier = op.resultIdentifier, await resolves(identifier) {
                 return .unknown(detail:
                     "update target \(identifier) resolves, but whether the patch applied cannot be "
                     + "determined from existence alone")
@@ -128,15 +134,31 @@ public struct Reconciler: Sendable {
     }
 }
 
-/// A journal `kind` string (`create_event`, `update_reminder`, …) split into its verb and
-/// entity. Unknown strings produce `nil` so the reconciler can flag them rather than guess.
+/// A journal `kind` string split into its verb and entity. Recognises `create_event`,
+/// `update_reminder`, … and the container forms `create_reminder_list` etc. Unknown
+/// strings produce `nil` so the reconciler flags them rather than guessing.
 public struct OperationKind: Sendable, Equatable {
     public enum Verb: String, Sendable { case create, update, delete }
 
     public let verb: Verb
     public let entity: RCCEntityType
+    /// True for `*_reminder_list` — the operation targets a calendar (container), not an
+    /// item, so reconciliation probes calendar existence rather than item existence.
+    public let isContainer: Bool
 
     public init?(_ raw: String) {
+        if raw.hasSuffix("_list") {
+            let stem = String(raw.dropLast("_list".count))
+            let parts = stem.split(separator: "_", maxSplits: 1)
+            guard parts.count == 2,
+                  let verb = Verb(rawValue: String(parts[0])),
+                  RCCEntityType(rawValue: String(parts[1])) == .reminder
+            else { return nil }
+            self.verb = verb
+            self.entity = .reminder
+            self.isContainer = true
+            return
+        }
         let parts = raw.split(separator: "_", maxSplits: 1)
         guard parts.count == 2,
               let verb = Verb(rawValue: String(parts[0])),
@@ -144,7 +166,10 @@ public struct OperationKind: Sendable, Equatable {
         else { return nil }
         self.verb = verb
         self.entity = entity
+        self.isContainer = false
     }
 
-    public var rawValue: String { "\(verb.rawValue)_\(entity.rawValue)" }
+    public var rawValue: String {
+        isContainer ? "\(verb.rawValue)_\(entity.rawValue)_list" : "\(verb.rawValue)_\(entity.rawValue)"
+    }
 }

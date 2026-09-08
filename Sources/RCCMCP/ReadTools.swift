@@ -179,8 +179,9 @@ public enum ReadTools {
         _ name: String,
         arguments: [String: Any],
         repository: any CalendarRepository,
-        generation: Int
+        store: Store?
     ) async throws -> [String: Any] {
+        let generation = Int((try? store?.currentLocatorGeneration()) ?? 0 ?? 0)
         switch name {
         case listSources:
             return try await runListSources(repository)
@@ -193,16 +194,31 @@ public enum ReadTools {
         case searchEvents:
             return try await runListEvents(arguments, repository, generation, requireQuery: true)
         case getEvent:
-            return try await runGetEvent(arguments, repository)
+            return try await runGetEvent(arguments, repository, store)
         case listReminders:
             return try await runListReminders(arguments, repository, generation, requireQuery: false)
         case searchReminders:
             return try await runListReminders(arguments, repository, generation, requireQuery: true)
         case getReminder:
-            return try await runGetReminder(arguments, repository)
+            return try await runGetReminder(arguments, repository, store)
         default:
             throw ToolError(code: "internal", message: "\(name) is not a read tool")
         }
+    }
+
+    /// Issue a locator for an item just returned by a `get_*` tool, so the model has a
+    /// tamper-proof handle to pass to a later `update_*` / `delete_*` (SPEC §9.4). Failing
+    /// to issue one is not fatal — the model can still use the bare identifier.
+    private static func locatorHandle(
+        for entity: RCCEntityType, calendarID: String, sourceID: String?, identifier: String,
+        recurringOccurrence: Date?, store: Store?
+    ) -> String? {
+        guard let store else { return nil }
+        return try? store.issueLocator(
+            entityType: entity.rawValue, calendarID: calendarID, sourceID: sourceID,
+            itemIdentifier: identifier,
+            occurrenceDate: recurringOccurrence.map(RCCTime.instant)
+        ).handle
     }
 
     // MARK: - Handlers
@@ -281,7 +297,8 @@ public enum ReadTools {
 
     private static func runGetEvent(
         _ arguments: [String: Any],
-        _ repository: any CalendarRepository
+        _ repository: any CalendarRepository,
+        _ store: Store?
     ) async throws -> [String: Any] {
         guard let id = string(arguments["event_id"]) else {
             throw ToolError(code: "invalid_datetime", message: "`event_id` is required")
@@ -290,7 +307,13 @@ public enum ReadTools {
         else {
             throw ToolError(code: "not_found", message: "no event with identifier \(id)")
         }
-        return envelope(data: project(event: event, detail: true))
+        var payload = project(event: event, detail: true)
+        payload["locator"] = locatorHandle(
+            for: .event, calendarID: event.calendarIdentifier, sourceID: event.sourceIdentifier,
+            identifier: id, recurringOccurrence: event.isRecurring ? event.occurrenceDate : nil,
+            store: store
+        ) as Any? ?? NSNull()
+        return envelope(data: payload)
     }
 
     private static func runListReminders(
@@ -335,7 +358,8 @@ public enum ReadTools {
 
     private static func runGetReminder(
         _ arguments: [String: Any],
-        _ repository: any CalendarRepository
+        _ repository: any CalendarRepository,
+        _ store: Store?
     ) async throws -> [String: Any] {
         guard let id = string(arguments["reminder_id"]) else {
             throw ToolError(code: "invalid_datetime", message: "`reminder_id` is required")
@@ -345,7 +369,12 @@ public enum ReadTools {
         }) else {
             throw ToolError(code: "not_found", message: "no reminder with identifier \(id)")
         }
-        return envelope(data: project(reminder: reminder, detail: true))
+        var payload = project(reminder: reminder, detail: true)
+        payload["locator"] = locatorHandle(
+            for: .reminder, calendarID: reminder.calendarIdentifier,
+            sourceID: reminder.sourceIdentifier, identifier: id, recurringOccurrence: nil, store: store
+        ) as Any? ?? NSNull()
+        return envelope(data: payload)
     }
 
     // MARK: - Pagination glue

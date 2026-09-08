@@ -8,7 +8,8 @@ Personal-use, single-machine, macOS 26+. See [SPEC.md](SPEC.md) for the full des
 
 ## Status
 
-**Milestones 1–3 of 7 done.** Next: Milestone 4 — the write path (CRUD + `if_match` + staging).
+**Milestones 1–4 of 7 done** (M4 core; the automation-only staging flow is M6). Next:
+Milestone 5 — release proof (install/uninstall, provider matrix, iOS parity, benchmarks).
 
 **M1 — platform & packaging proof.** Claude Desktop can talk to `rcc` end to end: a
 Desktop-spawned `rcc serve` has full Calendar and Reminders access and passes its platform
@@ -28,7 +29,15 @@ M4's write path.
 `search_reminders`, `get_reminder`. The full §9.1–9.3 DTO model (every field, enum
 name+raw value, `DateComponents` granularity, a `version` per item). Opaque base64url page
 cursors; `MCPServer` watches `EKEventStoreChanged` and turns an outstanding cursor
-`cursor_stale` on any external edit. Verified live against the real calendar. 197 tests.
+`cursor_stale` on any external edit.
+
+**M4 — write path.** Ten write tools (`create/update/delete_event`,
+`create/update/complete/delete_reminder`, `create/update/delete_reminder_list`), each run
+through `MutationExecutor`: the §9.6 journal sequence, `if_match` optimistic concurrency,
+locator resolution, recurrence-scope validation, idempotency replay, and omit/null/set
+patch semantics. `Reconciler` runs on `serve` startup. Verified live: full create → edit →
+conflict → delete lifecycle on a real event. 216 tests. The automation staging/impact
+matrix (§8.3) is Milestone 6.
 
 Built: the embedded `Info.plist` + Hardened Runtime + `personal-information` entitlements
 signing profile, notarization, one authoritative install path, the TCC self-disclaim

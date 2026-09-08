@@ -29,10 +29,20 @@ public protocol CalendarRepository: Sendable {
 
     func createEvent(_ draft: EventDraft) async throws -> String
     func events(inCalendar calendarIdentifier: String, from: Date, to: Date) async throws -> [EventSummary]
+    /// Events across the given calendars (or every event calendar when `nil`) in a bounded
+    /// window. A window longer than four years is walked in ≤4-year chunks — EventKit's
+    /// predicate silently truncates one otherwise (SPEC §9.4/§10).
+    func listEvents(calendarIdentifiers: [String]?, from: Date, to: Date) async throws -> [EventSummary]
+    func event(withIdentifier identifier: String) async throws -> EventSummary?
     func deleteEvent(identifier: String) async throws
 
     func createReminder(_ draft: ReminderDraft) async throws -> String
     func reminders(inCalendar calendarIdentifier: String) async throws -> [ReminderSummary]
+    /// Reminders matching a filter, across lists. Its own query contract, not the events'
+    /// one: most reminders have no due date, so a range is optional and, when given,
+    /// undated reminders are still included unless excluded explicitly (SPEC §10).
+    func listReminders(_ filter: ReminderFilter) async throws -> [ReminderSummary]
+    func reminder(withIdentifier identifier: String) async throws -> ReminderSummary?
     func deleteReminder(identifier: String) async throws
 
     /// Whether an item with this identifier currently resolves. Crash recovery (SPEC §9.6)
@@ -40,6 +50,18 @@ public protocol CalendarRepository: Sendable {
     /// `false` rather than throwing when access is missing — the caller (`Reconciler`)
     /// checks authorization itself and does not probe at all when it is absent.
     func itemExists(identifier: String, entityType: RCCEntityType) async -> Bool
+
+    /// Register for external calendar/reminder changes (`EKEventStoreChanged`, SPEC §7.4).
+    /// `onChange` fires whenever another process (Calendar.app, a sync) mutates the store.
+    /// Returns a token the caller must retain; releasing it removes the observer. The
+    /// in-memory fake never fires (nothing external can change it).
+    @discardableResult
+    func observeStoreChanges(_ onChange: @escaping @Sendable () -> Void) -> AnyObject?
+}
+
+public extension CalendarRepository {
+    @discardableResult
+    func observeStoreChanges(_ onChange: @escaping @Sendable () -> Void) -> AnyObject? { nil }
 }
 
 public enum RCCEntityType: String, Sendable, CaseIterable {
@@ -101,12 +123,19 @@ public struct SourceSummary: Sendable, Equatable, Identifiable {
     /// The raw `EKSourceType` value, preserved so an unrecognised future case is still
     /// reportable (SPEC §9.1's both-name-and-raw-value rule).
     public let sourceTypeRawValue: Int
+    /// True when the source represents a delegated/shared calendar account
+    /// (`EKSource.isDelegate`, macOS 13+, read-only).
+    public var isDelegate: Bool
 
-    public init(id: String, title: String, sourceType: String, sourceTypeRawValue: Int) {
+    public init(
+        id: String, title: String, sourceType: String, sourceTypeRawValue: Int,
+        isDelegate: Bool = false
+    ) {
         self.id = id
         self.title = title
         self.sourceType = sourceType
         self.sourceTypeRawValue = sourceTypeRawValue
+        self.isDelegate = isDelegate
     }
 }
 
@@ -119,6 +148,12 @@ public struct CalendarSummary: Sendable, Equatable, Identifiable {
     public let allowedEntityTypes: Set<RCCEntityType>
     public let sourceIdentifier: String?
     public let sourceTitle: String?
+    /// `#rrggbb`, when EventKit reports a colour.
+    public var colorHex: String?
+    /// Normalised `EKCalendarType` name + raw value.
+    public var type: EnumValue?
+    /// `busy` / `free` / `tentative` / `unavailable` names the calendar's source supports.
+    public var supportedEventAvailabilities: [String]
 
     public init(
         id: String,
@@ -128,7 +163,10 @@ public struct CalendarSummary: Sendable, Equatable, Identifiable {
         isImmutable: Bool,
         allowedEntityTypes: Set<RCCEntityType>,
         sourceIdentifier: String?,
-        sourceTitle: String?
+        sourceTitle: String?,
+        colorHex: String? = nil,
+        type: EnumValue? = nil,
+        supportedEventAvailabilities: [String] = []
     ) {
         self.id = id
         self.title = title
@@ -138,6 +176,9 @@ public struct CalendarSummary: Sendable, Equatable, Identifiable {
         self.allowedEntityTypes = allowedEntityTypes
         self.sourceIdentifier = sourceIdentifier
         self.sourceTitle = sourceTitle
+        self.colorHex = colorHex
+        self.type = type
+        self.supportedEventAvailabilities = supportedEventAvailabilities
     }
 
     public var isWritable: Bool { allowsContentModifications && !isImmutable }
@@ -159,6 +200,8 @@ public struct EventDraft: Sendable, Equatable {
     }
 }
 
+/// The event DTO (SPEC §9.1). One shape; the MCP layer projects it down to a compact set
+/// of fields for list results and returns the whole thing from `get_event` (SPEC §10, §13).
 public struct EventSummary: Sendable, Equatable, Identifiable {
     public let id: String
     public let title: String
@@ -166,12 +209,133 @@ public struct EventSummary: Sendable, Equatable, Identifiable {
     public let end: Date
     public let calendarIdentifier: String
 
-    public init(id: String, title: String, start: Date, end: Date, calendarIdentifier: String) {
+    public var isAllDay: Bool
+    /// IANA identifier of the event's own time zone, when it has one.
+    public var timeZoneIdentifier: String?
+    public var location: String?
+    public var structuredLocation: GeoLocation?
+    public var notes: String?
+    public var url: String?
+    /// confirmed / tentative / canceled / none. Only `canceled` is reliably reported
+    /// across sources (Apple's own caveat).
+    public var status: EnumValue?
+    /// busy / free / tentative / unavailable / notSupported.
+    public var availability: EnumValue?
+    public var isRecurring: Bool
+    /// A modified single instance detached from its series.
+    public var isDetached: Bool
+    public var occurrenceDate: Date?
+    public var recurrenceRules: [RecurrenceRule]
+    public var alarms: [Alarm]
+    public var participants: [Participant]
+    public var organizer: Participant?
+    public var birthdayContactIdentifier: String?
+    public var created: Date?
+    public var lastModified: Date?
+    public var sourceIdentifier: String?
+    /// Content hash for `if_match` (SPEC §9.4). Populated by the repository.
+    public var version: String
+
+    public init(
+        id: String, title: String, start: Date, end: Date, calendarIdentifier: String,
+        isAllDay: Bool = false, timeZoneIdentifier: String? = nil, location: String? = nil,
+        structuredLocation: GeoLocation? = nil, notes: String? = nil, url: String? = nil,
+        status: EnumValue? = nil, availability: EnumValue? = nil,
+        isRecurring: Bool = false, isDetached: Bool = false, occurrenceDate: Date? = nil,
+        recurrenceRules: [RecurrenceRule] = [], alarms: [Alarm] = [],
+        participants: [Participant] = [], organizer: Participant? = nil,
+        birthdayContactIdentifier: String? = nil, created: Date? = nil, lastModified: Date? = nil,
+        sourceIdentifier: String? = nil, version: String = ""
+    ) {
         self.id = id
         self.title = title
         self.start = start
         self.end = end
         self.calendarIdentifier = calendarIdentifier
+        self.isAllDay = isAllDay
+        self.timeZoneIdentifier = timeZoneIdentifier
+        self.location = location
+        self.structuredLocation = structuredLocation
+        self.notes = notes
+        self.url = url
+        self.status = status
+        self.availability = availability
+        self.isRecurring = isRecurring
+        self.isDetached = isDetached
+        self.occurrenceDate = occurrenceDate
+        self.recurrenceRules = recurrenceRules
+        self.alarms = alarms
+        self.participants = participants
+        self.organizer = organizer
+        self.birthdayContactIdentifier = birthdayContactIdentifier
+        self.created = created
+        self.lastModified = lastModified
+        self.sourceIdentifier = sourceIdentifier
+        self.version = version
+    }
+
+    /// The fields that go into the `if_match` version. Order is fixed; every field a
+    /// mutation could change is here (SPEC §9.4).
+    public var contentFields: [(String, String)] {
+        [
+            ("title", title),
+            ("start", RCCTime.instant(start)),
+            ("end", RCCTime.instant(end)),
+            ("allDay", isAllDay ? "1" : "0"),
+            ("tz", timeZoneIdentifier ?? ""),
+            ("location", location ?? ""),
+            ("notes", notes ?? ""),
+            ("url", url ?? ""),
+            ("availability", availability?.name ?? ""),
+            ("recurrence", recurrenceRules.map(\.canonicalString).joined(separator: "|")),
+            ("alarms", alarms.map { "\($0.type.name):\($0.relativeOffset ?? 0)" }.sorted().joined(separator: ",")),
+            ("calendar", calendarIdentifier),
+        ]
+    }
+}
+
+/// Filter for `list_reminders` / `search_reminders` (SPEC §10).
+public struct ReminderFilter: Sendable, Equatable {
+    public enum Completion: String, Sendable, CaseIterable { case any, incomplete, completed }
+
+    public var calendarIdentifiers: [String]?
+    public var completion: Completion
+    /// Completion-date lower/upper bound, applied only to completed reminders.
+    public var completedFrom: Date?
+    public var completedTo: Date?
+    /// Due/start component range. `nil` bounds are open. When a bound is set, undated
+    /// reminders are still returned unless `includeUndated` is false.
+    public var dueFrom: Date?
+    public var dueTo: Date?
+    public var includeUndated: Bool
+    /// Free-text match over title (and, when the caller opts in, notes).
+    public var text: String?
+    public var searchNotes: Bool
+    /// Keep only reminders whose priority bucket is at least this (`high` > `medium` > `low`).
+    public var minimumPriorityBucket: ReminderPriorityBucket?
+
+    public init(
+        calendarIdentifiers: [String]? = nil,
+        completion: Completion = .any,
+        completedFrom: Date? = nil,
+        completedTo: Date? = nil,
+        dueFrom: Date? = nil,
+        dueTo: Date? = nil,
+        includeUndated: Bool = true,
+        text: String? = nil,
+        searchNotes: Bool = false,
+        minimumPriorityBucket: ReminderPriorityBucket? = nil
+    ) {
+        self.calendarIdentifiers = calendarIdentifiers
+        self.completion = completion
+        self.completedFrom = completedFrom
+        self.completedTo = completedTo
+        self.dueFrom = dueFrom
+        self.dueTo = dueTo
+        self.includeUndated = includeUndated
+        self.text = text
+        self.searchNotes = searchNotes
+        self.minimumPriorityBucket = minimumPriorityBucket
     }
 }
 
@@ -187,17 +351,77 @@ public struct ReminderDraft: Sendable, Equatable {
     }
 }
 
+/// The reminder DTO (SPEC §9.2). No native subtask support — a permanent parity gap
+/// versus the Reminders app (confirmed against Apple's docs).
 public struct ReminderSummary: Sendable, Equatable, Identifiable {
     public let id: String
     public let title: String
     public let isCompleted: Bool
     public let calendarIdentifier: String
 
-    public init(id: String, title: String, isCompleted: Bool, calendarIdentifier: String) {
+    public var notes: String?
+    public var url: String?
+    public var location: String?
+    public var timeZoneIdentifier: String?
+    /// Preserves date-only vs date+time vs floating granularity (SPEC §9.5).
+    public var dueDate: DateComponentsDTO?
+    public var startDate: DateComponentsDTO?
+    public var completionDate: Date?
+    /// EventKit's raw 0–9 priority, always retained.
+    public var priorityRaw: Int
+    /// 1–4 high, 5 medium, 6–9 low, 0 none.
+    public var priorityBucket: String
+    public var recurrenceRules: [RecurrenceRule]
+    public var alarms: [Alarm]
+    public var created: Date?
+    public var lastModified: Date?
+    public var sourceIdentifier: String?
+    public var version: String
+
+    public init(
+        id: String, title: String, isCompleted: Bool, calendarIdentifier: String,
+        notes: String? = nil, url: String? = nil, location: String? = nil,
+        timeZoneIdentifier: String? = nil, dueDate: DateComponentsDTO? = nil,
+        startDate: DateComponentsDTO? = nil, completionDate: Date? = nil,
+        priorityRaw: Int = 0, priorityBucket: String = "none",
+        recurrenceRules: [RecurrenceRule] = [], alarms: [Alarm] = [],
+        created: Date? = nil, lastModified: Date? = nil, sourceIdentifier: String? = nil,
+        version: String = ""
+    ) {
         self.id = id
         self.title = title
         self.isCompleted = isCompleted
         self.calendarIdentifier = calendarIdentifier
+        self.notes = notes
+        self.url = url
+        self.location = location
+        self.timeZoneIdentifier = timeZoneIdentifier
+        self.dueDate = dueDate
+        self.startDate = startDate
+        self.completionDate = completionDate
+        self.priorityRaw = priorityRaw
+        self.priorityBucket = priorityBucket
+        self.recurrenceRules = recurrenceRules
+        self.alarms = alarms
+        self.created = created
+        self.lastModified = lastModified
+        self.sourceIdentifier = sourceIdentifier
+        self.version = version
+    }
+
+    public var contentFields: [(String, String)] {
+        [
+            ("title", title),
+            ("completed", isCompleted ? "1" : "0"),
+            ("notes", notes ?? ""),
+            ("url", url ?? ""),
+            ("location", location ?? ""),
+            ("due", dueDate?.canonicalString ?? ""),
+            ("start", startDate?.canonicalString ?? ""),
+            ("priority", String(priorityRaw)),
+            ("recurrence", recurrenceRules.map(\.canonicalString).joined(separator: "|")),
+            ("calendar", calendarIdentifier),
+        ]
     }
 }
 

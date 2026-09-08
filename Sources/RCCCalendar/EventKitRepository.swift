@@ -167,6 +167,44 @@ public actor EventKitRepository: CalendarRepository {
         return store.events(matching: predicate).compactMap(Self.summarize(event:))
     }
 
+    public func listEvents(
+        calendarIdentifiers: [String]?, from: Date, to: Date
+    ) async throws -> [EventSummary] {
+        try requireFullAccess(.event)
+        let calendars: [EKCalendar]?
+        if let identifiers = calendarIdentifiers {
+            calendars = identifiers.compactMap { store.calendar(withIdentifier: $0) }
+            if calendars?.isEmpty == true { return [] }
+        } else {
+            calendars = nil
+        }
+
+        // `predicateForEvents` silently truncates a window longer than four years, so walk
+        // it in ≤4-year chunks (SPEC §9.4/§10). An event straddling a chunk seam appears in
+        // both, so dedupe by identifier.
+        let fourYears: TimeInterval = 4 * 365 * 24 * 3600
+        var collected: [EventSummary] = []
+        var seen = Set<String>()
+        var windowStart = from
+        while windowStart < to {
+            let windowEnd = min(to, windowStart.addingTimeInterval(fourYears))
+            let predicate = store.predicateForEvents(
+                withStart: windowStart, end: windowEnd, calendars: calendars
+            )
+            for dto in store.events(matching: predicate).compactMap(Self.summarize(event:))
+            where seen.insert(dto.id).inserted {
+                collected.append(dto)
+            }
+            windowStart = windowEnd
+        }
+        return collected.sorted { ($0.start, $0.id) < ($1.start, $1.id) }
+    }
+
+    public func event(withIdentifier identifier: String) async throws -> EventSummary? {
+        try requireFullAccess(.event)
+        return store.event(withIdentifier: identifier).flatMap(Self.summarize(event:))
+    }
+
     public func deleteEvent(identifier: String) async throws {
         try requireFullAccess(.event)
         guard let event = store.event(withIdentifier: identifier) else {
@@ -212,6 +250,67 @@ public actor EventKitRepository: CalendarRepository {
         }
     }
 
+    public func listReminders(_ filter: ReminderFilter) async throws -> [ReminderSummary] {
+        try requireFullAccess(.reminder)
+        let calendars: [EKCalendar]? = filter.calendarIdentifiers?.compactMap {
+            store.calendar(withIdentifier: $0)
+        }
+        if let calendars, calendars.isEmpty { return [] }
+
+        let predicate: NSPredicate
+        switch filter.completion {
+        case .completed:
+            predicate = store.predicateForCompletedReminders(
+                withCompletionDateStarting: filter.completedFrom, ending: filter.completedTo,
+                calendars: calendars
+            )
+        case .incomplete:
+            predicate = store.predicateForIncompleteReminders(
+                withDueDateStarting: filter.dueFrom, ending: filter.dueTo, calendars: calendars
+            )
+        case .any:
+            predicate = store.predicateForReminders(in: calendars)
+        }
+
+        // Convert to DTOs inside the callback: `[EKReminder]` is not `Sendable` and must
+        // not cross the continuation (the same rule §7.4 applies to every fetched object).
+        var dtos: [ReminderSummary] = await withCheckedContinuation { continuation in
+            store.fetchReminders(matching: predicate) { reminders in
+                continuation.resume(returning: (reminders ?? []).map(Self.summarize(reminder:)))
+            }
+        }
+
+        // Post-fetch filters, applied before any pagination the caller layers on (SPEC §10).
+        if let text = filter.text, !text.isEmpty {
+            dtos = dtos.filter { reminder in
+                let haystack = filter.searchNotes
+                    ? "\(reminder.title)\n\(reminder.notes ?? "")"
+                    : reminder.title
+                return haystack.localizedCaseInsensitiveContains(text)
+            }
+        }
+        if let minimum = filter.minimumPriorityBucket {
+            dtos = dtos.filter { ReminderPriorityBucket(raw: $0.priorityRaw).rank >= minimum.rank }
+        }
+        // The `.any` / completed predicates ignore the due range; enforce it here, keeping
+        // undated reminders unless the caller excluded them.
+        if filter.completion != .incomplete, filter.dueFrom != nil || filter.dueTo != nil {
+            dtos = dtos.filter { reminder in
+                guard let due = Self.date(from: reminder.dueDate) else { return filter.includeUndated }
+                if let lower = filter.dueFrom, due < lower { return false }
+                if let upper = filter.dueTo, due > upper { return false }
+                return true
+            }
+        }
+
+        return dtos.sorted { Self.reminderOrder($0) < Self.reminderOrder($1) }
+    }
+
+    public func reminder(withIdentifier identifier: String) async throws -> ReminderSummary? {
+        try requireFullAccess(.reminder)
+        return (store.calendarItem(withIdentifier: identifier) as? EKReminder).map(Self.summarize(reminder:))
+    }
+
     public func deleteReminder(identifier: String) async throws {
         try requireFullAccess(.reminder)
         guard let reminder = store.calendarItem(withIdentifier: identifier) as? EKReminder else {
@@ -224,6 +323,43 @@ public actor EventKitRepository: CalendarRepository {
         }
     }
 
+    /// Best-effort `Date` from a component DTO, for the optional due-range filter. Uses the
+    /// component's own time zone, else the current calendar; a date-only value resolves to
+    /// local midnight.
+    static func date(from components: DateComponentsDTO?) -> Date? {
+        guard let components else { return nil }
+        var dateComponents = DateComponents()
+        dateComponents.year = components.year
+        dateComponents.month = components.month
+        dateComponents.day = components.day
+        dateComponents.hour = components.hour
+        dateComponents.minute = components.minute
+        dateComponents.second = components.second
+        var calendar = Calendar.current
+        if let identifier = components.timeZoneIdentifier, let zone = TimeZone(identifier: identifier) {
+            calendar.timeZone = zone
+        }
+        return calendar.date(from: dateComponents)
+    }
+
+    /// Stable list order (SPEC §10): incomplete before completed, then by due date with
+    /// undated last, then title, then identifier.
+    static func reminderOrder(_ reminder: ReminderSummary) -> some Comparable {
+        let due = date(from: reminder.dueDate)?.timeIntervalSince1970 ?? .greatestFiniteMagnitude
+        return SortKey(completed: reminder.isCompleted, due: due, title: reminder.title, id: reminder.id)
+    }
+
+    private struct SortKey: Comparable {
+        let completed: Bool
+        let due: Double
+        let title: String
+        let id: String
+        static func < (lhs: SortKey, rhs: SortKey) -> Bool {
+            (lhs.completed ? 1 : 0, lhs.due, lhs.title, lhs.id)
+                < (rhs.completed ? 1 : 0, rhs.due, rhs.title, rhs.id)
+        }
+    }
+
     public func itemExists(identifier: String, entityType: RCCEntityType) async -> Bool {
         guard Self.map(EKEventStore.authorizationStatus(for: entityType.ekEntityType)).grantsFullAccess
         else { return false }
@@ -233,6 +369,26 @@ public actor EventKitRepository: CalendarRepository {
         case .reminder:
             return (store.calendarItem(withIdentifier: identifier) as? EKReminder) != nil
         }
+    }
+
+    /// Observe `EKEventStoreChanged` (SPEC §7.4).
+    ///
+    /// `object: nil` and `queue: nil`: the notification is delivered by `EKEventStore`'s
+    /// own XPC connection on an internal queue, so it does not need the main run loop
+    /// turning, and the block runs synchronously on that queue. `onChange` must therefore
+    /// be thread-safe — the caller uses it only to bump a `FULLMUTEX` SQLite counter.
+    /// Deliberately NOT the typed `EKEventStore.EventStoreChanged` API, which SIGTRAPs when
+    /// the notification is posted off the main thread (docs/milestone-1.md §5.7).
+    ///
+    /// This does not recreate the store: `rcc` keeps no TTL cache (§7.4), converts every
+    /// fetched object to a value immediately, and re-runs each predicate per request, so a
+    /// long-lived `EKEventStore` still sees another process's writes on the next fetch.
+    public nonisolated func observeStoreChanges(
+        _ onChange: @escaping @Sendable () -> Void
+    ) -> AnyObject? {
+        NotificationCenter.default.addObserver(
+            forName: .EKEventStoreChanged, object: nil, queue: nil
+        ) { _ in onChange() }
     }
 
     // MARK: - Source selection
@@ -319,15 +475,6 @@ public actor EventKitRepository: CalendarRepository {
         return RCCAuthorizationStatus(known: known, rawValue: Int(status.rawValue))
     }
 
-    static func summarize(source: EKSource) -> SourceSummary {
-        SourceSummary(
-            id: source.sourceIdentifier,
-            title: source.title,
-            sourceType: name(for: source.sourceType),
-            sourceTypeRawValue: Int(source.sourceType.rawValue)
-        )
-    }
-
     static func name(for sourceType: EKSourceType) -> String {
         switch sourceType {
         case .local: return "local"
@@ -342,10 +489,27 @@ public actor EventKitRepository: CalendarRepository {
         }
     }
 
+    static func summarize(source: EKSource) -> SourceSummary {
+        SourceSummary(
+            id: source.sourceIdentifier,
+            title: source.title,
+            sourceType: name(for: source.sourceType),
+            sourceTypeRawValue: Int(source.sourceType.rawValue),
+            isDelegate: source.isDelegate
+        )
+    }
+
     static func summarize(calendar: EKCalendar) -> CalendarSummary {
         var allowed: Set<RCCEntityType> = []
         if calendar.allowedEntityTypes.contains(.event) { allowed.insert(.event) }
         if calendar.allowedEntityTypes.contains(.reminder) { allowed.insert(.reminder) }
+        let mask = calendar.supportedEventAvailabilities
+        let availabilities: [String] = [
+            (EKCalendarEventAvailabilityMask.busy, "busy"),
+            (.free, "free"),
+            (.tentative, "tentative"),
+            (.unavailable, "unavailable"),
+        ].compactMap { mask.contains($0.0) ? $0.1 : nil }
         return CalendarSummary(
             id: calendar.calendarIdentifier,
             title: calendar.title,
@@ -354,7 +518,10 @@ public actor EventKitRepository: CalendarRepository {
             isImmutable: calendar.isImmutable,
             allowedEntityTypes: allowed,
             sourceIdentifier: calendar.source?.sourceIdentifier,
-            sourceTitle: calendar.source?.title
+            sourceTitle: calendar.source?.title,
+            colorHex: hexString(from: calendar.cgColor),
+            type: EnumValue(name: calendarTypeName(calendar.type), raw: Int(calendar.type.rawValue)),
+            supportedEventAvailabilities: availabilities
         )
     }
 
@@ -362,22 +529,192 @@ public actor EventKitRepository: CalendarRepository {
         guard let identifier = event.eventIdentifier,
               let start = event.startDate,
               let end = event.endDate else { return nil }
-        return EventSummary(
+        var dto = EventSummary(
             id: identifier,
             title: event.title ?? "",
             start: start,
             end: end,
-            calendarIdentifier: event.calendar?.calendarIdentifier ?? ""
+            calendarIdentifier: event.calendar?.calendarIdentifier ?? "",
+            isAllDay: event.isAllDay,
+            timeZoneIdentifier: event.timeZone?.identifier,
+            location: event.location,
+            structuredLocation: geo(from: event.structuredLocation),
+            notes: event.hasNotes ? event.notes : nil,
+            url: event.url?.absoluteString,
+            status: EnumValue(name: statusName(event.status), raw: Int(event.status.rawValue)),
+            availability: EnumValue(
+                name: availabilityName(for: event.availability), raw: Int(event.availability.rawValue)
+            ),
+            isRecurring: event.hasRecurrenceRules,
+            isDetached: event.isDetached,
+            occurrenceDate: event.occurrenceDate,
+            recurrenceRules: (event.recurrenceRules ?? []).map(RecurrenceRule.init),
+            alarms: (event.alarms ?? []).map(alarm(from:)),
+            participants: (event.attendees ?? []).map { participant(from: $0) },
+            organizer: event.organizer.map { participant(from: $0) },
+            birthdayContactIdentifier: event.birthdayContactIdentifier,
+            created: event.creationDate,
+            lastModified: event.lastModifiedDate,
+            sourceIdentifier: event.calendar?.source?.sourceIdentifier
         )
+        dto.version = ContentVersion.make(dto.contentFields, lastModified: event.lastModifiedDate)
+        return dto
     }
 
     static func summarize(reminder: EKReminder) -> ReminderSummary {
-        ReminderSummary(
+        var dto = ReminderSummary(
             id: reminder.calendarItemIdentifier,
             title: reminder.title ?? "",
             isCompleted: reminder.isCompleted,
-            calendarIdentifier: reminder.calendar?.calendarIdentifier ?? ""
+            calendarIdentifier: reminder.calendar?.calendarIdentifier ?? "",
+            notes: reminder.hasNotes ? reminder.notes : nil,
+            url: reminder.url?.absoluteString,
+            location: reminder.location,
+            timeZoneIdentifier: reminder.timeZone?.identifier,
+            dueDate: reminder.dueDateComponents.map(DateComponentsDTO.init),
+            startDate: reminder.startDateComponents.map(DateComponentsDTO.init),
+            completionDate: reminder.completionDate,
+            priorityRaw: reminder.priority,
+            priorityBucket: ReminderPriorityBucket(raw: reminder.priority).rawValue,
+            recurrenceRules: (reminder.recurrenceRules ?? []).map(RecurrenceRule.init),
+            alarms: (reminder.alarms ?? []).map(alarm(from:)),
+            created: reminder.creationDate,
+            lastModified: reminder.lastModifiedDate,
+            sourceIdentifier: reminder.calendar?.source?.sourceIdentifier
         )
+        dto.version = ContentVersion.make(dto.contentFields, lastModified: reminder.lastModifiedDate)
+        return dto
+    }
+
+    // MARK: - Enum & value mapping
+
+    static func statusName(_ status: EKEventStatus) -> String {
+        switch status {
+        case .none: return "none"
+        case .confirmed: return "confirmed"
+        case .tentative: return "tentative"
+        case .canceled: return "canceled"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func availabilityName(for availability: EKEventAvailability) -> String {
+        switch availability {
+        case .notSupported: return "notSupported"
+        case .busy: return "busy"
+        case .free: return "free"
+        case .tentative: return "tentative"
+        case .unavailable: return "unavailable"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func calendarTypeName(_ type: EKCalendarType) -> String {
+        switch type {
+        case .local: return "local"
+        case .calDAV: return "calDAV"
+        case .exchange: return "exchange"
+        case .subscription: return "subscription"
+        case .birthday: return "birthday"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func participant(from participant: EKParticipant) -> Participant {
+        let url = participant.url.absoluteString
+        let email = url.lowercased().hasPrefix("mailto:") ? String(url.dropFirst("mailto:".count)) : nil
+        return Participant(
+            name: participant.name,
+            url: url,
+            email: email,
+            isCurrentUser: participant.isCurrentUser,
+            type: EnumValue(name: participantTypeName(participant.participantType),
+                            raw: Int(participant.participantType.rawValue)),
+            role: EnumValue(name: participantRoleName(participant.participantRole),
+                            raw: Int(participant.participantRole.rawValue)),
+            status: EnumValue(name: participantStatusName(participant.participantStatus),
+                              raw: Int(participant.participantStatus.rawValue))
+        )
+    }
+
+    static func participantTypeName(_ type: EKParticipantType) -> String {
+        switch type {
+        case .unknown: return "unknown"
+        case .person: return "person"
+        case .room: return "room"
+        case .resource: return "resource"
+        case .group: return "group"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func participantRoleName(_ role: EKParticipantRole) -> String {
+        switch role {
+        case .unknown: return "unknown"
+        case .required: return "required"
+        case .optional: return "optional"
+        case .chair: return "chair"
+        case .nonParticipant: return "nonParticipant"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func participantStatusName(_ status: EKParticipantStatus) -> String {
+        switch status {
+        case .unknown: return "unknown"
+        case .pending: return "pending"
+        case .accepted: return "accepted"
+        case .declined: return "declined"
+        case .tentative: return "tentative"
+        case .delegated: return "delegated"
+        case .completed: return "completed"
+        case .inProcess: return "inProcess"
+        @unknown default: return "unknown"
+        }
+    }
+
+    static func alarm(from alarm: EKAlarm) -> Alarm {
+        let typeName: String
+        switch alarm.type {
+        case .display: typeName = "display"
+        case .audio: typeName = "audio"
+        case .procedure: typeName = "procedure"
+        case .email: typeName = "email"
+        @unknown default: typeName = "unknown"
+        }
+        let proximity: EnumValue?
+        switch alarm.proximity {
+        case .none: proximity = nil
+        case .enter: proximity = EnumValue(name: "enter", raw: Int(alarm.proximity.rawValue))
+        case .leave: proximity = EnumValue(name: "leave", raw: Int(alarm.proximity.rawValue))
+        @unknown default: proximity = EnumValue(name: "unknown", raw: Int(alarm.proximity.rawValue))
+        }
+        return Alarm(
+            type: EnumValue(name: typeName, raw: Int(alarm.type.rawValue)),
+            relativeOffset: alarm.absoluteDate == nil ? alarm.relativeOffset : nil,
+            absoluteDate: alarm.absoluteDate,
+            structuredLocation: geo(from: alarm.structuredLocation),
+            proximity: proximity
+        )
+    }
+
+    static func geo(from location: EKStructuredLocation?) -> GeoLocation? {
+        guard let location else { return nil }
+        let coordinate = location.geoLocation?.coordinate
+        return GeoLocation(
+            title: location.title,
+            latitude: coordinate?.latitude,
+            longitude: coordinate?.longitude,
+            radius: location.radius == 0 ? nil : location.radius
+        )
+    }
+
+    static func hexString(from color: CGColor?) -> String? {
+        guard let color, let components = color.components, components.count >= 3 else { return nil }
+        let r = Int((components[0] * 255).rounded())
+        let g = Int((components[1] * 255).rounded())
+        let b = Int((components[2] * 255).rounded())
+        return String(format: "#%02x%02x%02x", r, g, b)
     }
 }
 

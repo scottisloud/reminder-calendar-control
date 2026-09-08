@@ -51,6 +51,18 @@ public struct MCPServer: Sendable {
     public func run() async {
         ProtocolIO.activate()
         Log.shared.info("mcp.serving", ["version": .safe(BuildInfo.versionString)])
+
+        // When another process changes the calendar store, bump the locator generation so
+        // any page cursor issued beforehand is refused with `cursor_stale` on its next use
+        // (SPEC §7.4/§10). Held for the lifetime of `run()`; released on return.
+        let changeObserver = store.map { store in
+            repository.observeStoreChanges {
+                try? store.invalidateAllLocators()
+                Log.shared.info("mcp.store_changed", ["outcome": .safe("locators_invalidated")])
+            }
+        } ?? nil
+        defer { changeObserver.map(NotificationCenter.default.removeObserver) }
+
         await ProtocolIO.readFrames { line in
             if let reply = await response(for: line) {
                 ProtocolIO.send(reply)
@@ -159,6 +171,35 @@ public struct MCPServer: Sendable {
                 // problems it cannot do anything about.
                 return .success(Self.toolResult(
                     ["error": Redaction.sanitize(String(describing: error), limit: 600)],
+                    isError: true
+                ))
+            }
+
+        case let name where ReadTools.names.contains(name):
+            // Every read tool refuses when the disclaim is unhealthy — the same gate the
+            // rest of the EventKit surface passes through.
+            if !DisclaimGate.isSatisfied(disclaim) {
+                return .success(Self.toolResult(
+                    ["error": "rcc cannot establish its own TCC identity; Calendar and Reminders are unavailable",
+                     "code": "disclaim_unavailable", "retryable": false],
+                    isError: true
+                ))
+            }
+            do {
+                var generation = 0
+                if let store, let current = try? store.currentLocatorGeneration() {
+                    generation = Int(current)
+                }
+                let payload = try await ReadTools.run(
+                    name, arguments: arguments, repository: repository, generation: generation
+                )
+                return .success(Self.toolResult(payload, isError: false))
+            } catch let error as ToolError {
+                return .success(Self.toolResult(error.payload, isError: true))
+            } catch {
+                return .success(Self.toolResult(
+                    ["error": Redaction.sanitize(String(describing: error), limit: 600),
+                     "code": "internal", "retryable": false],
                     isError: true
                 ))
             }

@@ -30,6 +30,17 @@ struct Serve: AsyncParsableCommand {
                 "outcome": .safe(Disclaim.result?.outcome.rawValue ?? "not_run"),
             ])
         }
-        await MCPServer(repository: EventKitRepository()).run()
+
+        // The state database backs the operation journal, locators, and idempotency keys,
+        // so every write tool needs it. Read tools and diagnostics tolerate its absence;
+        // if it cannot open, the server still starts and write tools report `state`.
+        let store: Store?
+        do {
+            store = try Store()
+        } catch {
+            Log.shared.error("serve.store_unavailable", ["error": .safe(String(describing: error))])
+            store = nil
+        }
+        await MCPServer(repository: EventKitRepository(), store: store).run()
     }
 }

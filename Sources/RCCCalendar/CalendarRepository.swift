@@ -28,6 +28,9 @@ public protocol CalendarRepository: Sendable {
     func deleteCalendar(identifier: String, entityType: RCCEntityType) async throws
 
     func createEvent(_ draft: EventDraft) async throws -> String
+    /// Apply a patch to an event and return the saved DTO (with a fresh `version`). A
+    /// recurring target requires `scope` (SPEC §9.4); a non-recurring one ignores it.
+    func updateEvent(identifier: String, patch: EventPatch, scope: RecurrenceScope?) async throws -> EventSummary
     func events(inCalendar calendarIdentifier: String, from: Date, to: Date) async throws -> [EventSummary]
     /// Events across the given calendars (or every event calendar when `nil`) in a bounded
     /// window. A window longer than four years is walked in ≤4-year chunks — EventKit's
@@ -37,6 +40,10 @@ public protocol CalendarRepository: Sendable {
     func deleteEvent(identifier: String) async throws
 
     func createReminder(_ draft: ReminderDraft) async throws -> String
+    func updateReminder(identifier: String, patch: ReminderPatch) async throws -> ReminderSummary
+    /// `complete_reminder` is its own action because it sets `isCompleted` and
+    /// `completionDate` together (SPEC §10). Returns the saved DTO.
+    func setReminderCompleted(identifier: String, completed: Bool) async throws -> ReminderSummary
     func reminders(inCalendar calendarIdentifier: String) async throws -> [ReminderSummary]
     /// Reminders matching a filter, across lists. Its own query contract, not the events'
     /// one: most reminders have no due date, so a range is optional and, when given,

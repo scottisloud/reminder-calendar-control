@@ -115,7 +115,7 @@ struct MCPServerTests {
     @Test("Every advertised tool has a name, a description, and an object input schema")
     func toolDescriptorShape() throws {
         let tools = Tools.descriptors
-        #expect(tools.count == 2 + ReadTools.names.count)
+        #expect(tools.count == 2 + ReadTools.names.count + WriteTools.names.count)
         var names = Set<String>()
         for tool in tools {
             let name = try #require(tool["name"] as? String)
@@ -135,7 +135,7 @@ struct MCPServerTests {
     @Test("Only genuinely read-only tools claim to be read-only")
     func readOnlyHintIsHonest() throws {
         // The only tool that writes anything.
-        let mutating: Set<String> = [Tools.runPlatformSelfTest]
+        let mutating = WriteTools.names.union([Tools.runPlatformSelfTest])
         for tool in Tools.descriptors {
             let name = try #require(tool["name"] as? String)
             let annotations = try #require(tool["annotations"] as? [String: Any])
@@ -158,7 +158,7 @@ struct MCPServerTests {
         ))
         let tools = try #require((response["result"] as? [String: Any])?["tools"] as? [[String: Any]])
         let names = Set(tools.compactMap { $0["name"] as? String })
-        #expect(names == ReadTools.names.union([Tools.getSystemStatus, Tools.runPlatformSelfTest]))
+        #expect(names == ReadTools.names.union(WriteTools.names).union([Tools.getSystemStatus, Tools.runPlatformSelfTest]))
     }
 
     @Test("A read tool runs end to end and returns the envelope in structuredContent")

@@ -176,15 +176,7 @@ public struct MCPServer: Sendable {
             }
 
         case let name where ReadTools.names.contains(name):
-            // Every read tool refuses when the disclaim is unhealthy — the same gate the
-            // rest of the EventKit surface passes through.
-            if !DisclaimGate.isSatisfied(disclaim) {
-                return .success(Self.toolResult(
-                    ["error": "rcc cannot establish its own TCC identity; Calendar and Reminders are unavailable",
-                     "code": "disclaim_unavailable", "retryable": false],
-                    isError: true
-                ))
-            }
+            if let gate = disclaimGate() { return gate }
             do {
                 var generation = 0
                 if let store, let current = try? store.currentLocatorGeneration() {
@@ -197,16 +189,46 @@ public struct MCPServer: Sendable {
             } catch let error as ToolError {
                 return .success(Self.toolResult(error.payload, isError: true))
             } catch {
+                return .success(Self.toolResult(Self.internalErrorPayload(error), isError: true))
+            }
+
+        case let name where WriteTools.names.contains(name):
+            if let gate = disclaimGate() { return gate }
+            guard let store else {
                 return .success(Self.toolResult(
-                    ["error": Redaction.sanitize(String(describing: error), limit: 600),
-                     "code": "internal", "retryable": false],
+                    ["error": "the local state database is unavailable, so writes cannot be journalled",
+                     "code": "state", "retryable": false],
                     isError: true
                 ))
+            }
+            do {
+                let executor = MutationExecutor(repository: repository, store: store)
+                let payload = try await WriteTools.run(name, arguments: arguments, executor: executor)
+                return .success(Self.toolResult(payload, isError: false))
+            } catch let error as ToolError {
+                return .success(Self.toolResult(error.payload, isError: true))
+            } catch {
+                return .success(Self.toolResult(Self.internalErrorPayload(error), isError: true))
             }
 
         default:
             return .protocolError(-32602, "Unknown tool: \(name)")
         }
+    }
+
+    /// The shared "rcc has no TCC identity" refusal for every EventKit-touching tool.
+    private func disclaimGate() -> ToolOutcome? {
+        guard !DisclaimGate.isSatisfied(disclaim) else { return nil }
+        return .success(Self.toolResult(
+            ["error": "rcc cannot establish its own TCC identity; Calendar and Reminders are unavailable",
+             "code": "disclaim_unavailable", "retryable": false],
+            isError: true
+        ))
+    }
+
+    private static func internalErrorPayload(_ error: any Error) -> [String: Any] {
+        ["error": Redaction.sanitize(String(describing: error), limit: 600),
+         "code": "internal", "retryable": false]
     }
 
     // MARK: - Envelope construction

@@ -62,22 +62,26 @@ struct LocatorTests {
         #expect(try store.resolveLocator(issued.handle, now: later) == .expired)
     }
 
-    @Test("invalidateAllLocators makes every prior handle resolve .staleGeneration")
+    @Test("invalidateAllLocators bumps the generation; a prior handle still resolves but is not current")
     func generationBump() throws {
         let store = try store()
         let before = try store.issueLocator(
             entityType: "event", calendarID: "cal", sourceID: nil, itemIdentifier: "EK-1"
         )
-        #expect(try store.resolveLocator(before.handle).locator != nil)
+        #expect(try store.isLocatorCurrent(before))
 
         try store.invalidateAllLocators()
-        #expect(try store.resolveLocator(before.handle) == .staleGeneration)
 
-        // A handle issued after the bump is fine again.
+        // The handle still resolves — generation staleness is a mutation-time `if_match`
+        // concern, not a "wrong handle" one — but it is no longer current.
+        let resolved = try #require(try store.resolveLocator(before.handle).locator)
+        #expect(resolved.itemIdentifier == "EK-1")
+        #expect(try store.isLocatorCurrent(resolved) == false)
+
         let after = try store.issueLocator(
             entityType: "event", calendarID: "cal", sourceID: nil, itemIdentifier: "EK-2"
         )
-        #expect(try store.resolveLocator(after.handle).locator != nil)
+        #expect(try store.isLocatorCurrent(after))
         #expect(after.generation == before.generation + 1)
     }
 

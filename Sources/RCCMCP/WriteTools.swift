@@ -52,7 +52,8 @@ public enum WriteTools {
         case .conflict(let current): return "the item changed since you last saw it (current version \(current))"
         case .locatorUnknown: return "that locator is not recognised"
         case .locatorExpired: return "that locator has expired; re-read the item to get a fresh one"
-        case .locatorStale: return "the calendar store changed since that locator was issued; re-read the item"
+        case .staleTargetNeedsIfMatch:
+            return "the calendar changed since that locator was issued; re-read the item and pass its `if_match`"
         case .targetUnspecified: return "provide a `locator` or an `identifier` for the target"
         case .bareIdentifierRejectedForRecurring:
             return "this is a recurring event — pass a `locator` (from a read) and a `recurrence_scope`"

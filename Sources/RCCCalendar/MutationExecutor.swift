@@ -84,9 +84,11 @@ public struct MutationExecutor: Sendable {
     public enum ExecutorError: Error, Equatable {
         case notFound(String)
         case conflict(current: String)
+        /// The handle predates an external calendar change; the caller must re-read the
+        /// item and pass its `if_match` to confirm what they are acting on (SPEC §9.4).
+        case staleTargetNeedsIfMatch
         case locatorUnknown
         case locatorExpired
-        case locatorStale
         case targetUnspecified
         case bareIdentifierRejectedForRecurring
         case recurrenceScopeRequired
@@ -99,10 +101,9 @@ public struct MutationExecutor: Sendable {
         public var code: String {
             switch self {
             case .notFound: return "not_found"
-            case .conflict: return "conflict"
+            case .conflict, .staleTargetNeedsIfMatch: return "conflict"
             case .locatorUnknown, .targetUnspecified: return "not_found"
             case .locatorExpired: return "approval_stale"
-            case .locatorStale: return "cursor_stale"
             case .bareIdentifierRejectedForRecurring, .recurrenceScopeRequired: return "unsupported"
             case .illegalClear, .emptyPatch: return "invalid_datetime"
             case .readOnly: return "read_only"
@@ -251,10 +252,16 @@ public struct MutationExecutor: Sendable {
     private func resolveTarget(_ request: Request, entity: RCCEntityType) async throws -> String {
         if let handle = request.targetLocator {
             switch try store.resolveLocator(handle) {
-            case .ok(let locator): return locator.itemIdentifier
+            case .ok(let locator):
+                // A handle from before an external change is still usable, but only with an
+                // `if_match` — re-resolving proves the item exists, not that it is the one
+                // the caller last saw (SPEC §9.4).
+                if request.ifMatch == nil, try !store.isLocatorCurrent(locator) {
+                    throw ExecutorError.staleTargetNeedsIfMatch
+                }
+                return locator.itemIdentifier
             case .unknown: throw ExecutorError.locatorUnknown
             case .expired: throw ExecutorError.locatorExpired
-            case .staleGeneration: throw ExecutorError.locatorStale
             }
         }
         guard let identifier = request.targetIdentifier else {

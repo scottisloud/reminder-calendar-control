@@ -25,14 +25,16 @@ public struct Locator: Sendable, Equatable {
     public var isRecurringOccurrence: Bool { occurrenceDate != nil }
 }
 
-/// The outcome of resolving a handle. Only `.ok` carries a usable locator; every other
-/// case maps to a distinct SPEC §10.1 error code so the caller can tell "you have the
-/// wrong handle" from "your handle aged out" from "the store moved under you".
+/// The outcome of resolving a handle. Only `.ok` carries a usable locator.
+///
+/// A handle from an older generation still resolves `.ok` — the generation counter is for
+/// pagination `cursor_stale` (SPEC §10), not for mutation targets. A mutation target's
+/// staleness is caught by `if_match` on the item's `version`; the executor additionally
+/// requires an `if_match` when the handle predates a store change (`Locator.isCurrent`).
 public enum LocatorResolution: Sendable, Equatable {
     case ok(Locator)
-    case unknown          // never issued, or already pruned
-    case expired          // past its TTL
-    case staleGeneration  // issued before the last EKEventStoreChanged
+    case unknown  // never issued, or already pruned
+    case expired  // past its TTL
 
     public var locator: Locator? {
         if case .ok(let locator) = self { return locator }
@@ -127,13 +129,17 @@ extension Store {
         ) else {
             return .unknown
         }
-        if try locator.generation < currentLocatorGeneration() {
-            return .staleGeneration
-        }
         if let expiry = RCCTime.parse(locator.expiresAt), expiry <= now {
             return .expired
         }
         return .ok(locator)
+    }
+
+    /// Whether `locator` was issued in the current generation — i.e. no external calendar
+    /// change has happened since. The executor uses this to insist on an `if_match` for a
+    /// handle that predates a store change (SPEC §9.4).
+    public func isLocatorCurrent(_ locator: Locator) throws -> Bool {
+        try locator.generation >= currentLocatorGeneration()
     }
 
     /// Delete locators that are expired or from a superseded generation.

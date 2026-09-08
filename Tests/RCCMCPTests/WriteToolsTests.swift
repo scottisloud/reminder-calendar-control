@@ -155,6 +155,34 @@ struct WriteToolsTests {
         #expect(all.count == 1)
     }
 
+    @Test("reminder list: create, rename, delete-with-count; a mixed-entity calendar is refused")
+    func reminderLists() async throws {
+        let (ex, repo, _) = try await setup()
+
+        let created = try #require(try await run(WriteTools.createReminderList, [
+            "title": "Groceries", "source_id": "src-icloud",
+        ], ex)["data"] as? [String: Any])
+        let listID = created["result_identifier"] as! String
+        #expect(await repo.calendarExists(identifier: listID))
+
+        _ = try await run(WriteTools.updateReminderList, ["identifier": listID, "title": "Shopping"], ex)
+        let renamed = try await repo.calendar(withIdentifier: listID, entityType: .reminder)
+        #expect(renamed?.title == "Shopping")
+
+        _ = try await run(WriteTools.createReminder, ["calendar_id": listID, "title": "milk"], ex)
+        let deleted = try #require(try await run(WriteTools.deleteReminderList, ["identifier": listID], ex)["data"] as? [String: Any])
+        #expect(deleted["reminders_removed"] as? Int == 1)
+        #expect(await repo.calendarExists(identifier: listID) == false)
+
+        // "cal" from setup() allows both entity types — refused.
+        do {
+            _ = try await run(WriteTools.deleteReminderList, ["identifier": "cal"], ex)
+            Issue.record("expected unsupported")
+        } catch let error as ToolError {
+            #expect(error.code == "unsupported")
+        }
+    }
+
     @Test("Descriptors: delete tools are the only destructive ones, none claim read-only")
     func descriptorShape() {
         for tool in WriteTools.descriptors {

@@ -63,6 +63,23 @@ public struct MCPServer: Sendable {
         } ?? nil
         defer { changeObserver.map(NotificationCenter.default.removeObserver) }
 
+        // Crash recovery (SPEC §9.6): Claude Desktop respawns `rcc serve` fresh each
+        // session, so this is the "on next start" reconciliation point. Any mutation left
+        // mid-flight by a previous process is resolved against current EventKit state
+        // before the first request is served. Best-effort — a failure here does not stop
+        // the server from starting.
+        if let store {
+            let summary = try? await Reconciler(repository: repository, store: store).run()
+            if let summary, summary.examined > 0 {
+                Log.shared.info("mcp.reconciled", [
+                    "succeeded": .int(summary.reconciledSucceeded.count),
+                    "failed": .int(summary.reconciledFailed.count),
+                    "outcome_unknown": .int(summary.outcomeUnknown.count),
+                    "deferred": .int(summary.deferred.count),
+                ])
+            }
+        }
+
         await ProtocolIO.readFrames { line in
             if let reply = await response(for: line) {
                 ProtocolIO.send(reply)
@@ -178,12 +195,8 @@ public struct MCPServer: Sendable {
         case let name where ReadTools.names.contains(name):
             if let gate = disclaimGate() { return gate }
             do {
-                var generation = 0
-                if let store, let current = try? store.currentLocatorGeneration() {
-                    generation = Int(current)
-                }
                 let payload = try await ReadTools.run(
-                    name, arguments: arguments, repository: repository, generation: generation
+                    name, arguments: arguments, repository: repository, store: store
                 )
                 return .success(Self.toolResult(payload, isError: false))
             } catch let error as ToolError {

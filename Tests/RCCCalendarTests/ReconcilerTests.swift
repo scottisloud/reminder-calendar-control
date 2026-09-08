@@ -184,6 +184,34 @@ struct ReconcilerTests {
         #expect(summary.outcomeUnknown == [op.id])
     }
 
+    @Test("A container op reconciles against calendar existence, not item existence")
+    func containerReconcile() async throws {
+        let (store, url) = try makeStore()
+        let repo = await repository()
+        await repo.insert(calendar: CalendarSummary(
+            id: "list-1", title: "L", allowsContentModifications: true, isSubscribed: false,
+            isImmutable: false, allowedEntityTypes: [.reminder],
+            sourceIdentifier: "s", sourceTitle: "S"
+        ))
+
+        // create_reminder_list crash after the calendar was made + id recorded → succeeded.
+        let made = try store.prepareOperation(
+            Store.OperationIntent(kind: "create_reminder_list", context: .live, intentJSON: "{}")
+        )
+        try store.markExecuting(made.id)
+        try store.recordResultIdentifier("list-1", for: made.id)
+
+        // delete_reminder_list whose target no longer resolves → succeeded.
+        let gone = try store.prepareOperation(
+            Store.OperationIntent(kind: "delete_reminder_list", context: .live, intentJSON: "{}")
+        )
+        try store.markExecuting(gone.id)
+        try store.recordResultIdentifier("list-removed", for: gone.id)
+
+        let summary = try await Reconciler(repository: repo, store: try Store(url: url)).run()
+        #expect(Set(summary.reconciledSucceeded) == [made.id, gone.id])
+    }
+
     @Test("A clean start reconciles nothing")
     func cleanStart() async throws {
         let (_, url) = try makeStore()

@@ -167,6 +167,44 @@ public actor EventKitRepository: CalendarRepository {
         return store.events(matching: predicate).compactMap(Self.summarize(event:))
     }
 
+    public func listEvents(
+        calendarIdentifiers: [String]?, from: Date, to: Date
+    ) async throws -> [EventSummary] {
+        try requireFullAccess(.event)
+        let calendars: [EKCalendar]?
+        if let identifiers = calendarIdentifiers {
+            calendars = identifiers.compactMap { store.calendar(withIdentifier: $0) }
+            if calendars?.isEmpty == true { return [] }
+        } else {
+            calendars = nil
+        }
+
+        // `predicateForEvents` silently truncates a window longer than four years, so walk
+        // it in ≤4-year chunks (SPEC §9.4/§10). An event straddling a chunk seam appears in
+        // both, so dedupe by identifier.
+        let fourYears: TimeInterval = 4 * 365 * 24 * 3600
+        var collected: [EventSummary] = []
+        var seen = Set<String>()
+        var windowStart = from
+        while windowStart < to {
+            let windowEnd = min(to, windowStart.addingTimeInterval(fourYears))
+            let predicate = store.predicateForEvents(
+                withStart: windowStart, end: windowEnd, calendars: calendars
+            )
+            for dto in store.events(matching: predicate).compactMap(Self.summarize(event:))
+            where seen.insert(dto.id).inserted {
+                collected.append(dto)
+            }
+            windowStart = windowEnd
+        }
+        return collected.sorted { ($0.start, $0.id) < ($1.start, $1.id) }
+    }
+
+    public func event(withIdentifier identifier: String) async throws -> EventSummary? {
+        try requireFullAccess(.event)
+        return store.event(withIdentifier: identifier).flatMap(Self.summarize(event:))
+    }
+
     public func deleteEvent(identifier: String) async throws {
         try requireFullAccess(.event)
         guard let event = store.event(withIdentifier: identifier) else {
@@ -212,6 +250,67 @@ public actor EventKitRepository: CalendarRepository {
         }
     }
 
+    public func listReminders(_ filter: ReminderFilter) async throws -> [ReminderSummary] {
+        try requireFullAccess(.reminder)
+        let calendars: [EKCalendar]? = filter.calendarIdentifiers?.compactMap {
+            store.calendar(withIdentifier: $0)
+        }
+        if let calendars, calendars.isEmpty { return [] }
+
+        let predicate: NSPredicate
+        switch filter.completion {
+        case .completed:
+            predicate = store.predicateForCompletedReminders(
+                withCompletionDateStarting: filter.completedFrom, ending: filter.completedTo,
+                calendars: calendars
+            )
+        case .incomplete:
+            predicate = store.predicateForIncompleteReminders(
+                withDueDateStarting: filter.dueFrom, ending: filter.dueTo, calendars: calendars
+            )
+        case .any:
+            predicate = store.predicateForReminders(in: calendars)
+        }
+
+        // Convert to DTOs inside the callback: `[EKReminder]` is not `Sendable` and must
+        // not cross the continuation (the same rule §7.4 applies to every fetched object).
+        var dtos: [ReminderSummary] = await withCheckedContinuation { continuation in
+            store.fetchReminders(matching: predicate) { reminders in
+                continuation.resume(returning: (reminders ?? []).map(Self.summarize(reminder:)))
+            }
+        }
+
+        // Post-fetch filters, applied before any pagination the caller layers on (SPEC §10).
+        if let text = filter.text, !text.isEmpty {
+            dtos = dtos.filter { reminder in
+                let haystack = filter.searchNotes
+                    ? "\(reminder.title)\n\(reminder.notes ?? "")"
+                    : reminder.title
+                return haystack.localizedCaseInsensitiveContains(text)
+            }
+        }
+        if let minimum = filter.minimumPriorityBucket {
+            dtos = dtos.filter { ReminderPriorityBucket(raw: $0.priorityRaw).rank >= minimum.rank }
+        }
+        // The `.any` / completed predicates ignore the due range; enforce it here, keeping
+        // undated reminders unless the caller excluded them.
+        if filter.completion != .incomplete, filter.dueFrom != nil || filter.dueTo != nil {
+            dtos = dtos.filter { reminder in
+                guard let due = Self.date(from: reminder.dueDate) else { return filter.includeUndated }
+                if let lower = filter.dueFrom, due < lower { return false }
+                if let upper = filter.dueTo, due > upper { return false }
+                return true
+            }
+        }
+
+        return dtos.sorted { Self.reminderOrder($0) < Self.reminderOrder($1) }
+    }
+
+    public func reminder(withIdentifier identifier: String) async throws -> ReminderSummary? {
+        try requireFullAccess(.reminder)
+        return (store.calendarItem(withIdentifier: identifier) as? EKReminder).map(Self.summarize(reminder:))
+    }
+
     public func deleteReminder(identifier: String) async throws {
         try requireFullAccess(.reminder)
         guard let reminder = store.calendarItem(withIdentifier: identifier) as? EKReminder else {
@@ -221,6 +320,43 @@ public actor EventKitRepository: CalendarRepository {
             try store.remove(reminder, commit: true)
         } catch {
             throw CalendarRepositoryError.native("deleting reminder \(identifier)", underlying: error as NSError)
+        }
+    }
+
+    /// Best-effort `Date` from a component DTO, for the optional due-range filter. Uses the
+    /// component's own time zone, else the current calendar; a date-only value resolves to
+    /// local midnight.
+    static func date(from components: DateComponentsDTO?) -> Date? {
+        guard let components else { return nil }
+        var dateComponents = DateComponents()
+        dateComponents.year = components.year
+        dateComponents.month = components.month
+        dateComponents.day = components.day
+        dateComponents.hour = components.hour
+        dateComponents.minute = components.minute
+        dateComponents.second = components.second
+        var calendar = Calendar.current
+        if let identifier = components.timeZoneIdentifier, let zone = TimeZone(identifier: identifier) {
+            calendar.timeZone = zone
+        }
+        return calendar.date(from: dateComponents)
+    }
+
+    /// Stable list order (SPEC §10): incomplete before completed, then by due date with
+    /// undated last, then title, then identifier.
+    static func reminderOrder(_ reminder: ReminderSummary) -> some Comparable {
+        let due = date(from: reminder.dueDate)?.timeIntervalSince1970 ?? .greatestFiniteMagnitude
+        return SortKey(completed: reminder.isCompleted, due: due, title: reminder.title, id: reminder.id)
+    }
+
+    private struct SortKey: Comparable {
+        let completed: Bool
+        let due: Double
+        let title: String
+        let id: String
+        static func < (lhs: SortKey, rhs: SortKey) -> Bool {
+            (lhs.completed ? 1 : 0, lhs.due, lhs.title, lhs.id)
+                < (rhs.completed ? 1 : 0, rhs.due, rhs.title, rhs.id)
         }
     }
 

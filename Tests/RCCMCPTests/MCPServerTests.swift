@@ -115,12 +115,16 @@ struct MCPServerTests {
     @Test("Every advertised tool has a name, a description, and an object input schema")
     func toolDescriptorShape() throws {
         let tools = Tools.descriptors
-        #expect(tools.count == 2)
+        #expect(tools.count == 2 + ReadTools.names.count)
+        var names = Set<String>()
         for tool in tools {
-            #expect((tool["name"] as? String)?.isEmpty == false)
+            let name = try #require(tool["name"] as? String)
+            #expect(!name.isEmpty)
+            #expect(names.insert(name).inserted, "duplicate descriptor \(name)")
             #expect((tool["description"] as? String)?.isEmpty == false)
             let schema = try #require(tool["inputSchema"] as? [String: Any])
             #expect(schema["type"] as? String == "object")
+            #expect(schema["additionalProperties"] as? Bool == false)
         }
         #expect(JSONSerialization.isValidJSONObject(["tools": tools]))
     }
@@ -128,19 +132,18 @@ struct MCPServerTests {
     /// `readOnlyHint: true` is not decoration — it is the only annotation Claude Desktop
     /// forwards, and it exempts a tool from the approval policy. Marking a mutating tool
     /// read-only would be a real security bug.
-    @Test("Only the genuinely read-only tool claims to be read-only")
+    @Test("Only genuinely read-only tools claim to be read-only")
     func readOnlyHintIsHonest() throws {
+        // The only tool that writes anything.
+        let mutating: Set<String> = [Tools.runPlatformSelfTest]
         for tool in Tools.descriptors {
             let name = try #require(tool["name"] as? String)
             let annotations = try #require(tool["annotations"] as? [String: Any])
-            let readOnly = annotations["readOnlyHint"] as? Bool
-            switch name {
-            case Tools.getSystemStatus:
-                #expect(readOnly == true)
-            case Tools.runPlatformSelfTest:
-                #expect(readOnly == false)
-            default:
-                Issue.record("unexpected tool \(name)")
+            let readOnly = annotations["readOnlyHint"] as? Bool ?? false
+            if mutating.contains(name) {
+                #expect(readOnly == false, "\(name) writes but claims readOnlyHint")
+            } else {
+                #expect(readOnly == true, "\(name) is read-only but does not claim it")
             }
             // EventKit is a closed local domain; nothing here reaches the network.
             #expect(annotations["openWorldHint"] as? Bool == false)
@@ -154,8 +157,82 @@ struct MCPServerTests {
             #"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#, to: server
         ))
         let tools = try #require((response["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        #expect(tools.map { $0["name"] as? String }.sorted { ($0 ?? "") < ($1 ?? "") }
-            == [Tools.getSystemStatus, Tools.runPlatformSelfTest].sorted())
+        let names = Set(tools.compactMap { $0["name"] as? String })
+        #expect(names == ReadTools.names.union([Tools.getSystemStatus, Tools.runPlatformSelfTest]))
+    }
+
+    @Test("A read tool runs end to end and returns the envelope in structuredContent")
+    func readToolThroughServer() async throws {
+        let repo = InMemoryCalendarRepository(scenario: .init(eventStatus: .fullAccess))
+        let server = try makeServer(repository: repo)
+        let response = try #require(try await send(
+            #"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"list_sources","arguments":{}}}"#,
+            to: server
+        ))
+        let result = try #require(response["result"] as? [String: Any])
+        #expect(result["isError"] as? Bool == false)
+        let envelope = try #require(result["structuredContent"] as? [String: Any])
+        #expect(envelope["schema_version"] as? Int == 1)
+        #expect(envelope["data"] is [[String: Any]])
+    }
+
+    @Test("A store change between pages invalidates an outstanding cursor")
+    func cursorStaleAcrossStoreChange() async throws {
+        let store = try makeStore()
+        let repo = InMemoryCalendarRepository(scenario: .init(eventStatus: .fullAccess))
+        await repo.insert(calendar: CalendarSummary(
+            id: "c", title: "C", allowsContentModifications: true, isSubscribed: false,
+            isImmutable: false, allowedEntityTypes: [.event], sourceIdentifier: "s", sourceTitle: "S"
+        ))
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        for hour in 0..<4 {
+            _ = try await repo.createEvent(EventDraft(
+                calendarIdentifier: "c", title: "E\(hour)",
+                start: base.addingTimeInterval(Double(hour) * 3600),
+                end: base.addingTimeInterval(Double(hour) * 3600 + 60)
+            ))
+        }
+        let server = try makeServer(repository: repo, store: store)
+
+        let firstCall = #"""
+        {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_events","arguments":{"from":"2023-11-14T00:00:00.000Z","to":"2023-11-16T00:00:00.000Z","limit":2}}}
+        """#
+        let first = try #require(try await send(firstCall, to: server))
+        let firstEnvelope = try #require(
+            ((first["result"] as? [String: Any])?["structuredContent"]) as? [String: Any]
+        )
+        let cursor = try #require((firstEnvelope["pagination"] as? [String: Any])?["next_cursor"] as? String)
+
+        // Another process writes to the calendar.
+        try store.invalidateAllLocators()
+
+        let secondCall = """
+        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_events","arguments":{"from":"2023-11-14T00:00:00.000Z","to":"2023-11-16T00:00:00.000Z","limit":2,"cursor":"\(cursor)"}}}
+        """
+        let second = try #require(try await send(secondCall, to: server))
+        let result = try #require(second["result"] as? [String: Any])
+        #expect(result["isError"] as? Bool == true)
+        let envelope = try #require(result["structuredContent"] as? [String: Any])
+        #expect(envelope["code"] as? String == "cursor_stale")
+    }
+
+    @Test("Read tools refuse when the disclaim is unhealthy")
+    func readToolGatedByDisclaim() async throws {
+        let unhealthy = Disclaim.Result(
+            outcome: .notDisclaimed, generation: 1, responsiblePID: 2, pid: 1, mechanismAvailable: true
+        )
+        let server = MCPServer(
+            repository: InMemoryCalendarRepository(scenario: .init(eventStatus: .fullAccess)),
+            store: try makeStore(),
+            disclaim: unhealthy
+        )
+        let response = try #require(try await send(
+            #"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_sources","arguments":{}}}"#,
+            to: server
+        ))
+        let result = try #require(response["result"] as? [String: Any])
+        #expect(result["isError"] as? Bool == true)
+        #expect((result["structuredContent"] as? [String: Any])?["code"] as? String == "disclaim_unavailable")
     }
 
     @Test("Structured content is mirrored into a text block")

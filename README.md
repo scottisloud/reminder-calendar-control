@@ -8,7 +8,7 @@ Personal-use, single-machine, macOS 26+. See [SPEC.md](SPEC.md) for the full des
 
 ## Status
 
-**Milestones 1 and 2 of 7 done.** Next: Milestone 3 — the read path.
+**Milestones 1–3 of 7 done.** Next: Milestone 4 — the write path (CRUD + `if_match` + staging).
 
 **M1 — platform & packaging proof.** Claude Desktop can talk to `rcc` end to end: a
 Desktop-spawned `rcc serve` has full Calendar and Reminders access and passes its platform
@@ -20,8 +20,15 @@ state machine), opaque server-issued locators with generation invalidation, idem
 keys with replay, a `RecurrenceRule` DTO that round-trips through EventKit, and
 `ContentVersion`/`if_match` for optimistic concurrency. `Reconciler.run()` recovers every
 mid-flight operation on startup — verified against a fault injected at every journal
-transition. 169 tests, none touching EventKit or Claude Desktop. The `if_match` /
-recurrence-scope / locator *enforcement* wiring lands with M3's read/write path.
+transition. The `if_match` / recurrence-scope / locator *enforcement* wiring lands with
+M4's write path.
+
+**M3 — read path.** Nine MCP read tools: `list_sources`, `list_calendars`,
+`list_reminder_lists`, `list_events`, `search_events`, `get_event`, `list_reminders`,
+`search_reminders`, `get_reminder`. The full §9.1–9.3 DTO model (every field, enum
+name+raw value, `DateComponents` granularity, a `version` per item). Opaque base64url page
+cursors; `MCPServer` watches `EKEventStoreChanged` and turns an outstanding cursor
+`cursor_stale` on any external edit. Verified live against the real calendar. 197 tests.
 
 Built: the embedded `Info.plist` + Hardened Runtime + `personal-information` entitlements
 signing profile, notarization, one authoritative install path, the TCC self-disclaim

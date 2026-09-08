@@ -65,6 +65,6 @@ public enum Tools {
                 ],
                 "_meta": ["anthropic/requiresUserInteraction": true],
             ],
-        ] + ReadTools.descriptors
+        ] + ReadTools.descriptors + WriteTools.descriptors
     }
 }

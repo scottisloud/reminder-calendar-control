@@ -39,6 +39,9 @@ public struct MutationExecutor: Sendable {
             case updateReminder(ReminderPatch)
             case completeReminder(Bool)
             case deleteReminder
+            case createReminderList(title: String, sourceIdentifier: String)
+            case updateReminderList(title: String)
+            case deleteReminderList
         }
 
         public var action: Action
@@ -78,6 +81,8 @@ public struct MutationExecutor: Sendable {
         /// pass to a later mutation.
         public var locator: String?
         public var version: String?
+        /// Reminders removed alongside a deleted list (SPEC §9.3).
+        public var affectedCount: Int?
         public var replayed: Bool
     }
 
@@ -140,7 +145,8 @@ public struct MutationExecutor: Sendable {
             try store.markSucceeded(op.id, resultIdentifier: result.resultIdentifier)
             return Outcome(
                 operationID: op.id, resultIdentifier: result.resultIdentifier,
-                locator: result.locator, version: result.version, replayed: false
+                locator: result.locator, version: result.version,
+                affectedCount: result.affectedCount, replayed: false
             )
         } catch let error as ExecutorError {
             try? store.markFailed(op.id, errorCode: error.code, detail: "\(error)")
@@ -159,6 +165,7 @@ public struct MutationExecutor: Sendable {
         var resultIdentifier: String?
         var locator: String?
         var version: String?
+        var affectedCount: Int?
     }
 
     private func perform(
@@ -246,6 +253,27 @@ public struct MutationExecutor: Sendable {
             try store.recordResultIdentifier(id, for: op.id)
             try await repository.deleteReminder(identifier: id)
             return PerformResult(resultIdentifier: id)
+
+        case .createReminderList(let title, let sourceIdentifier):
+            let calendar = try await repository.createReminderList(
+                title: title, sourceIdentifier: sourceIdentifier
+            )
+            return PerformResult(resultIdentifier: calendar.id, version: nil)
+
+        case .updateReminderList(let title):
+            guard let id = request.targetIdentifier ?? request.targetLocator else {
+                throw ExecutorError.targetUnspecified
+            }
+            let calendar = try await repository.updateReminderList(identifier: id, title: title)
+            return PerformResult(resultIdentifier: calendar.id)
+
+        case .deleteReminderList:
+            guard let id = request.targetIdentifier ?? request.targetLocator else {
+                throw ExecutorError.targetUnspecified
+            }
+            try store.recordResultIdentifier(id, for: op.id)
+            let removed = try await repository.deleteReminderList(identifier: id)
+            return PerformResult(resultIdentifier: id, affectedCount: removed)
         }
     }
 
@@ -306,7 +334,7 @@ public struct MutationExecutor: Sendable {
         }
         return Outcome(
             operationID: prior.id, resultIdentifier: prior.resultIdentifier,
-            locator: nil, version: nil, replayed: true
+            locator: nil, version: nil, affectedCount: nil, replayed: true
         )
     }
 
@@ -318,6 +346,9 @@ public struct MutationExecutor: Sendable {
         case .createReminder: return OperationKind("create_reminder")!
         case .updateReminder, .completeReminder: return OperationKind("update_reminder")!
         case .deleteReminder: return OperationKind("delete_reminder")!
+        case .createReminderList: return OperationKind("create_reminder_list")!
+        case .updateReminderList: return OperationKind("update_reminder_list")!
+        case .deleteReminderList: return OperationKind("delete_reminder_list")!
         }
     }
 }

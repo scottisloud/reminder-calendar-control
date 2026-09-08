@@ -2,6 +2,7 @@ import Foundation
 import Testing
 
 @testable import RCCCalendar
+@testable import RCCCore
 @testable import RCCMCP
 
 @Suite("ReadTools")
@@ -37,11 +38,18 @@ struct ReadToolsTests {
         return repo
     }
 
+    private func tempStore() throws -> Store {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("rcc-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return try Store(url: dir.appendingPathComponent("state.sqlite3", isDirectory: false))
+    }
+
     private func run(
         _ name: String, _ repo: any CalendarRepository,
-        args: [String: Any] = [:], generation: Int = 0
+        args: [String: Any] = [:], store: Store? = nil
     ) async throws -> [String: Any] {
-        try await ReadTools.run(name, arguments: args, repository: repo, generation: generation)
+        try await ReadTools.run(name, arguments: args, repository: repo, store: store)
     }
 
     @Test("list_sources returns the accounts")
@@ -149,24 +157,45 @@ struct ReadToolsTests {
         #expect((completed["data"] as? [[String: Any]])?.isEmpty == true)
     }
 
-    @Test("A stale cursor surfaces as a cursor_stale ToolError")
+    @Test("A cursor issued before a store change surfaces as cursor_stale")
     func staleCursor() async throws {
         let repo = try await seededRepository()
+        let store = try tempStore()
         let args: [String: Any] = [
             "from": "2023-11-14T00:00:00.000Z", "to": "2023-11-16T00:00:00.000Z", "limit": 2,
         ]
-        let first = try await run(ReadTools.listEvents, repo, args: args, generation: 3)
+        let first = try await run(ReadTools.listEvents, repo, args: args, store: store)
         let cursor = try #require((first["pagination"] as? [String: Any])?["next_cursor"] as? String)
+
+        try store.invalidateAllLocators()  // an external calendar change
 
         var pageArgs = args
         pageArgs["cursor"] = cursor
         do {
-            _ = try await run(ReadTools.listEvents, repo, args: pageArgs, generation: 4)
+            _ = try await run(ReadTools.listEvents, repo, args: pageArgs, store: store)
             Issue.record("expected cursor_stale")
         } catch let error as ToolError {
             #expect(error.code == "cursor_stale")
             #expect(error.payload["retryable"] as? Bool == true)
         }
+    }
+
+    @Test("get_event and get_reminder hand back a resolvable locator")
+    func getIssuesLocator() async throws {
+        let repo = try await seededRepository()
+        let store = try tempStore()
+        let list = try await run(ReadTools.listEvents, repo, args: [
+            "from": "2023-11-14T00:00:00.000Z", "to": "2023-11-16T00:00:00.000Z",
+        ], store: store)
+        let eventID = try #require(((list["data"] as? [[String: Any]])?.first)?["id"] as? String)
+
+        let detail = try await run(ReadTools.getEvent, repo, args: ["event_id": eventID], store: store)
+        let handle = try #require((detail["data"] as? [String: Any])?["locator"] as? String)
+        #expect(try store.resolveLocator(handle).locator?.itemIdentifier == eventID)
+
+        // Without a store, `locator` is present but null.
+        let noStore = try await run(ReadTools.getEvent, repo, args: ["event_id": eventID])
+        #expect((noStore["data"] as? [String: Any])?["locator"] is NSNull)
     }
 
     @Test("search_events requires a query and filters post-fetch")

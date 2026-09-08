@@ -134,6 +134,79 @@ public actor EventKitRepository: CalendarRepository {
         }
     }
 
+    public func calendarExists(identifier: String) async -> Bool {
+        let anyAccess = Self.map(EKEventStore.authorizationStatus(for: .event)).grantsFullAccess
+            || Self.map(EKEventStore.authorizationStatus(for: .reminder)).grantsFullAccess
+        guard anyAccess else { return false }
+        return store.calendar(withIdentifier: identifier) != nil
+    }
+
+    // MARK: - Reminder lists (SPEC §9.3)
+
+    public func createReminderList(
+        title: String, sourceIdentifier: String
+    ) async throws -> CalendarSummary {
+        try requireFullAccess(.reminder)
+        guard let source = store.sources.first(where: { $0.sourceIdentifier == sourceIdentifier }) else {
+            throw CalendarRepositoryError.notFound("source \(sourceIdentifier)")
+        }
+        let calendar = EKCalendar(for: .reminder, eventStore: store)
+        calendar.title = title
+        calendar.source = source
+        do {
+            try store.saveCalendar(calendar, commit: true)
+        } catch {
+            throw CalendarRepositoryError.native("creating reminder list '\(title)'", underlying: error as NSError)
+        }
+        return Self.summarize(calendar: calendar)
+    }
+
+    public func updateReminderList(
+        identifier: String, title: String
+    ) async throws -> CalendarSummary {
+        try requireFullAccess(.reminder)
+        let calendar = try reminderOnlyCalendar(identifier)
+        calendar.title = title
+        do {
+            try store.saveCalendar(calendar, commit: true)
+        } catch {
+            throw CalendarRepositoryError.native("renaming reminder list \(identifier)", underlying: error as NSError)
+        }
+        return Self.summarize(calendar: calendar)
+    }
+
+    public func deleteReminderList(identifier: String) async throws -> Int {
+        try requireFullAccess(.reminder)
+        let calendar = try reminderOnlyCalendar(identifier)
+        guard !calendar.isImmutable else {
+            throw CalendarRepositoryError.readOnly("reminder list \(identifier)")
+        }
+        let predicate = store.predicateForReminders(in: [calendar])
+        let count: Int = await withCheckedContinuation { continuation in
+            store.fetchReminders(matching: predicate) { continuation.resume(returning: ($0 ?? []).count) }
+        }
+        do {
+            try store.removeCalendar(calendar, commit: true)
+        } catch {
+            throw CalendarRepositoryError.native("deleting reminder list \(identifier)", underlying: error as NSError)
+        }
+        return count
+    }
+
+    /// A calendar that holds reminders and nothing else. A mixed-entity calendar is
+    /// refused — deleting it could take events with it (SPEC §9.3).
+    private func reminderOnlyCalendar(_ identifier: String) throws -> EKCalendar {
+        guard let calendar = store.calendar(withIdentifier: identifier) else {
+            throw CalendarRepositoryError.notFound("reminder list \(identifier)")
+        }
+        guard calendar.allowedEntityTypes == .reminder else {
+            throw CalendarRepositoryError.unsupported(
+                "\(identifier) is not a reminder-only calendar; rcc will not modify a mixed-entity calendar"
+            )
+        }
+        return calendar
+    }
+
     // MARK: - Events
 
     public func createEvent(_ draft: EventDraft) async throws -> String {

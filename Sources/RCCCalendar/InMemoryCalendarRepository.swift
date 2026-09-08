@@ -134,6 +134,70 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         storedReminders = storedReminders.filter { $0.value.calendarIdentifier != identifier }
     }
 
+    public func calendarExists(identifier: String) async -> Bool {
+        storedCalendars[identifier] != nil
+    }
+
+    // MARK: - Reminder lists
+
+    public func createReminderList(
+        title: String, sourceIdentifier: String
+    ) async throws -> CalendarSummary {
+        try requireAccess(.reminder)
+        try consumeInjectedFailure()
+        guard let source = storedSources.first(where: { $0.id == sourceIdentifier }) else {
+            throw CalendarRepositoryError.notFound("source \(sourceIdentifier)")
+        }
+        let calendar = CalendarSummary(
+            id: mintIdentifier("list"), title: title, allowsContentModifications: true,
+            isSubscribed: false, isImmutable: false, allowedEntityTypes: [.reminder],
+            sourceIdentifier: source.id, sourceTitle: source.title
+        )
+        storedCalendars[calendar.id] = calendar
+        return calendar
+    }
+
+    public func updateReminderList(
+        identifier: String, title: String
+    ) async throws -> CalendarSummary {
+        try requireAccess(.reminder)
+        try consumeInjectedFailure()
+        let current = try reminderOnlyCalendar(identifier)
+        let updated = CalendarSummary(
+            id: current.id, title: title, allowsContentModifications: current.allowsContentModifications,
+            isSubscribed: current.isSubscribed, isImmutable: current.isImmutable,
+            allowedEntityTypes: current.allowedEntityTypes,
+            sourceIdentifier: current.sourceIdentifier, sourceTitle: current.sourceTitle
+        )
+        storedCalendars[identifier] = updated
+        return updated
+    }
+
+    public func deleteReminderList(identifier: String) async throws -> Int {
+        try requireAccess(.reminder)
+        try consumeInjectedFailure()
+        let calendar = try reminderOnlyCalendar(identifier)
+        guard !calendar.isImmutable else {
+            throw CalendarRepositoryError.readOnly("reminder list \(identifier)")
+        }
+        let removed = storedReminders.values.filter { $0.calendarIdentifier == identifier }.count
+        storedCalendars.removeValue(forKey: identifier)
+        storedReminders = storedReminders.filter { $0.value.calendarIdentifier != identifier }
+        return removed
+    }
+
+    private func reminderOnlyCalendar(_ identifier: String) throws -> CalendarSummary {
+        guard let calendar = storedCalendars[identifier] else {
+            throw CalendarRepositoryError.notFound("reminder list \(identifier)")
+        }
+        guard calendar.allowedEntityTypes == [.reminder] else {
+            throw CalendarRepositoryError.unsupported(
+                "\(identifier) is not a reminder-only calendar"
+            )
+        }
+        return calendar
+    }
+
     // MARK: - Events
 
     public func createEvent(_ draft: EventDraft) async throws -> String {

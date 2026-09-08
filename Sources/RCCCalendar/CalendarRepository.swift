@@ -26,6 +26,17 @@ public protocol CalendarRepository: Sendable {
 
     func createCalendar(title: String, entityType: RCCEntityType, sourceIdentifier: String) async throws -> CalendarSummary
     func deleteCalendar(identifier: String, entityType: RCCEntityType) async throws
+    /// Whether a calendar with this identifier resolves. Used by crash recovery for
+    /// container operations (SPEC §9.6).
+    func calendarExists(identifier: String) async -> Bool
+
+    /// Reminder-list management (SPEC §9.3). Restricted to calendars whose
+    /// `allowedEntityTypes` is reminder-only — a mixed-entity calendar returns
+    /// `unsupported`, since removing it could delete events too.
+    func createReminderList(title: String, sourceIdentifier: String) async throws -> CalendarSummary
+    func updateReminderList(identifier: String, title: String) async throws -> CalendarSummary
+    /// Returns the number of reminders removed with the list.
+    func deleteReminderList(identifier: String) async throws -> Int
 
     func createEvent(_ draft: EventDraft) async throws -> String
     /// Apply a patch to an event and return the saved DTO (with a fresh `version`). A

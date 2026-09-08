@@ -18,13 +18,17 @@ public enum WriteTools {
     public static let updateReminder = "update_reminder"
     public static let completeReminder = "complete_reminder"
     public static let deleteReminder = "delete_reminder"
+    public static let createReminderList = "create_reminder_list"
+    public static let updateReminderList = "update_reminder_list"
+    public static let deleteReminderList = "delete_reminder_list"
 
     public static let names: Set<String> = [
         createEvent, updateEvent, deleteEvent,
         createReminder, updateReminder, completeReminder, deleteReminder,
+        createReminderList, updateReminderList, deleteReminderList,
     ]
 
-    public static let destructive: Set<String> = [deleteEvent, deleteReminder]
+    public static let destructive: Set<String> = [deleteEvent, deleteReminder, deleteReminderList]
 
     // MARK: - Dispatch
 
@@ -34,13 +38,15 @@ public enum WriteTools {
         let request = try buildRequest(name, arguments)
         do {
             let outcome = try await executor.execute(request)
-            return ReadTools.envelope(data: [
+            var data: [String: Any] = [
                 "operation_id": outcome.operationID,
                 "result_identifier": outcome.resultIdentifier as Any? ?? NSNull(),
                 "locator": outcome.locator as Any? ?? NSNull(),
                 "version": outcome.version as Any? ?? NSNull(),
                 "replayed": outcome.replayed,
-            ])
+            ]
+            if let count = outcome.affectedCount { data["reminders_removed"] = count }
+            return ReadTools.envelope(data: data)
         } catch let error as MutationExecutor.ExecutorError {
             throw ToolError(code: error.code, message: describe(error))
         }
@@ -135,6 +141,35 @@ public enum WriteTools {
                 ifMatch: ReadTools.string(args["if_match"]),
                 idempotencyKey: idem(args),
                 intentJSON: intent("delete_reminder")
+            )
+
+        case createReminderList:
+            guard let title = ReadTools.string(args["title"]) else {
+                throw ToolError(code: "invalid_datetime", message: "`title` is required")
+            }
+            guard let source = ReadTools.string(args["source_id"]) else {
+                throw ToolError(code: "invalid_datetime", message: "`source_id` is required (see list_sources)")
+            }
+            return .init(
+                action: .createReminderList(title: title, sourceIdentifier: source),
+                idempotencyKey: idem(args), intentJSON: intent("create_reminder_list")
+            )
+
+        case updateReminderList:
+            guard let title = ReadTools.string(args["title"]) else {
+                throw ToolError(code: "invalid_datetime", message: "`title` is required")
+            }
+            return .init(
+                action: .updateReminderList(title: title),
+                targetIdentifier: ReadTools.string(args["identifier"]) ?? ReadTools.string(args["list_id"]),
+                idempotencyKey: idem(args), intentJSON: intent("update_reminder_list")
+            )
+
+        case deleteReminderList:
+            return .init(
+                action: .deleteReminderList,
+                targetIdentifier: ReadTools.string(args["identifier"]) ?? ReadTools.string(args["list_id"]),
+                idempotencyKey: idem(args), intentJSON: intent("delete_reminder_list")
             )
 
         default:
@@ -346,6 +381,34 @@ public enum WriteTools {
                 "description": "Delete a reminder.",
                 "inputSchema": target(),
                 "annotations": annotations("Delete Reminder", destructive: true),
+                "_meta": ["anthropic/requiresUserInteraction": true],
+            ],
+            [
+                "name": createReminderList,
+                "description": "Create a new reminder list. `title` and `source_id` (from list_sources) required.",
+                "inputSchema": ["type": "object", "additionalProperties": false, "properties": [
+                    "title": ["type": "string"], "source_id": ["type": "string"],
+                    "idempotency_key": ["type": "string"],
+                ], "required": ["title", "source_id"]],
+                "annotations": annotations("Create Reminder List", destructive: false),
+            ],
+            [
+                "name": updateReminderList,
+                "description": "Rename a reminder list. Reminder-only lists only — a mixed-entity calendar is refused.",
+                "inputSchema": ["type": "object", "additionalProperties": false, "properties": [
+                    "identifier": ["type": "string"], "list_id": ["type": "string"],
+                    "title": ["type": "string"], "idempotency_key": ["type": "string"],
+                ], "required": ["title"]],
+                "annotations": annotations("Update Reminder List", destructive: false),
+            ],
+            [
+                "name": deleteReminderList,
+                "description": "Delete a reminder list and everything in it. Reminder-only lists only. The result reports `reminders_removed`.",
+                "inputSchema": ["type": "object", "additionalProperties": false, "properties": [
+                    "identifier": ["type": "string"], "list_id": ["type": "string"],
+                    "idempotency_key": ["type": "string"],
+                ]],
+                "annotations": annotations("Delete Reminder List", destructive: true),
                 "_meta": ["anthropic/requiresUserInteraction": true],
             ],
         ]

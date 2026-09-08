@@ -178,10 +178,14 @@ struct MutationExecutorTests {
 
     // MARK: - Locator lifecycle
 
-    @Test("A locator that is unknown / expired / from an old generation fails distinctly")
+    @Test("Locator lifecycle: unknown, expired, and stale-without-if_match fail distinctly")
     func locatorLifecycle() async throws {
         let store = try makeStore()
         let repo = await repo()
+        await repo.insert(event: EventSummary(
+            id: "evt-1", title: "Fixed", start: Date(timeIntervalSince1970: 1_700_000_000),
+            end: Date(timeIntervalSince1970: 1_700_003_600), calendarIdentifier: "cal"
+        ))
         let executor = MutationExecutor(repository: repo, store: store)
         let patch = { var p = EventPatch(); p.title = .set("x"); return p }()
 
@@ -189,23 +193,29 @@ struct MutationExecutorTests {
             _ = try await executor.execute(.init(action: .updateEvent(patch), targetLocator: "deadbeef"))
         }
 
-        let t0 = Date(timeIntervalSince1970: 1_000_000)
         let expiring = try store.issueLocator(
             entityType: "event", calendarID: "cal", sourceID: nil, itemIdentifier: "evt-1",
-            ttl: 10, now: t0
+            ttl: 10, now: Date(timeIntervalSince1970: 1_000_000)
         )
-        // The executor uses the real clock; a locator issued far in the past is expired.
         await #expect(throws: MutationExecutor.ExecutorError.locatorExpired) {
             _ = try await executor.execute(.init(action: .updateEvent(patch), targetLocator: expiring.handle))
         }
 
-        let live = try store.issueLocator(
+        // A handle from before a store change: usable, but only with an if_match.
+        let handle = try store.issueLocator(
             entityType: "event", calendarID: "cal", sourceID: nil, itemIdentifier: "evt-1"
         )
+        let currentVersion = try #require(try await repo.event(withIdentifier: "evt-1")).version
         try store.invalidateAllLocators()
-        await #expect(throws: MutationExecutor.ExecutorError.locatorStale) {
-            _ = try await executor.execute(.init(action: .updateEvent(patch), targetLocator: live.handle))
+
+        await #expect(throws: MutationExecutor.ExecutorError.staleTargetNeedsIfMatch) {
+            _ = try await executor.execute(.init(action: .updateEvent(patch), targetLocator: handle.handle))
         }
+        // With the current if_match it goes through.
+        let ok = try await executor.execute(.init(
+            action: .updateEvent(patch), targetLocator: handle.handle, ifMatch: currentVersion
+        ))
+        #expect(ok.resultIdentifier == "evt-1")
     }
 
     // MARK: - Idempotency

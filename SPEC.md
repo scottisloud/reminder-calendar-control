@@ -93,7 +93,7 @@ There is exactly **one authoritative file** for MCP, setup, and automation — t
 
 **Updates:** repeat step 2's atomic replace, then run `rcc setup --verify` — a fast, idempotent check (not a full re-grant) confirming the TCC grant, LaunchAgent, and Keychain access still resolve correctly against the new binary's signature. `rcc doctor` reports the exact path, version, and signing identity of the binary currently serving MCP and confirms the LaunchAgent plist points at the identical path, so a partial/failed update is immediately visible rather than silently running mismatched versions.
 
-**Uninstall:** removes the LaunchAgent and the `claude_desktop_config.json` entry, and — per the existing uninstall behavior — asks explicitly whether to preserve or delete persisted state (§16).
+**Uninstall:** removes the LaunchAgent and the `claude_desktop_config.json` entry, and asks explicitly whether to preserve or delete `rcc`'s own persisted state and logs (§16); `--remove-binary` also deletes the binary. **[v5] Uninstall never changes Calendar or Reminders data — including the `--dev` fixture calendars**, which are left in place and named in the output. `rcc` is an interface to that data, not its owner; installing or uninstalling it has no effect there.
 
 ### 6.2 Self-disclaim mechanism & one-time guard
 
@@ -421,7 +421,7 @@ Other elements, unchanged in substance from v3: calendar/reminder text is untrus
 - `rcc doctor [--json]` / `rcc status` — diagnostics and health snapshot, including which exact binary path/version/signature is serving MCP vs. what the LaunchAgent runs (§6.1), so a split-version install is immediately visible.
 - `rcc automations run [--dry-run] [--rule <id>]`.
 - LaunchAgent install/status/uninstall are idempotent operations.
-- SQLite schema migrations are versioned; `rcc setup --uninstall` offers backup/export before removing state and asks explicitly whether to preserve or delete it.
+- SQLite schema migrations are versioned; `rcc setup --uninstall` asks explicitly whether to preserve or delete state (`--keep-state` / `--purge-state` non-interactively). **[v5]** No backup/export step — dropped by explicit direction at Milestone 5. Uninstall never touches Calendar or Reminders (§6.1).
 - Stable CLI exit codes distinct per failure category (permission, network/API, validation, internal).
 
 ## 17. Open Risks / Unknowns

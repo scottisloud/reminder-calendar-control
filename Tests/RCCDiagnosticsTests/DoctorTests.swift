@@ -238,4 +238,37 @@ struct InstallShapeDoctorTests {
         #expect(check.facts["bundle_path"]?.hasSuffix("/RCC.app/Contents/MacOS/rcc") == true)
         #expect(check.remediation?.contains("--bundle") == true)
     }
+
+    /// The record is not the calendar: a fixture deleted in Reminders.app used to read
+    /// "both provisioned" forever (found at Milestone 5).
+    @Test("A recorded dev fixture that no longer exists in EventKit is a warning")
+    func missingFixtureCalendar() async throws {
+        let store = try Store()
+        defer {
+            try? store.removeDevFixture(.event)
+            try? store.removeDevFixture(.reminder)
+        }
+        let repository = InMemoryCalendarRepository(
+            scenario: .init(eventStatus: .fullAccess, reminderStatus: .fullAccess)
+        )
+        await repository.insert(calendar: CalendarSummary(
+            id: "fixture-events", title: "RCC Dev events x", allowsContentModifications: true,
+            isSubscribed: false, isImmutable: false, allowedEntityTypes: [.event],
+            sourceIdentifier: "src", sourceTitle: "iCloud"
+        ))
+        for (type, id) in [(Store.DevFixture.EntityType.event, "fixture-events"),
+                           (.reminder, "fixture-reminders-gone")] {
+            try store.recordDevFixture(Store.DevFixture(
+                entityType: type, calendarID: id, title: "RCC Dev \(type.rawValue)s x",
+                sourceID: "src", sourceTitle: "iCloud", createdAt: RCCTime.instant()
+            ))
+        }
+
+        let result = await Doctor(repository: repository).devFixtureCheck()
+        #expect(result.status == .warn)
+        #expect(result.detail.contains("reminder"))
+        #expect(result.facts["event_exists"] == "true")
+        #expect(result.facts["reminder_exists"] == "false")
+        #expect(result.remediation?.contains("rcc setup --dev") == true)
+    }
 }

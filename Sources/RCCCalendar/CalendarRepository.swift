@@ -7,9 +7,6 @@ import RCCCore
 /// testable against `InMemoryCalendarRepository` and real EventKit is reserved for
 /// adapter/integration tests.
 ///
-/// Milestone 1 deliberately keeps this surface small — enough to prove authorization,
-/// provision the dev fixture, and round-trip one write. The full DTO model in SPEC §9
-/// lands in Milestone 2 and will widen this protocol rather than replace it.
 public protocol CalendarRepository: Sendable {
     func authorizationStatus(for entityType: RCCEntityType) async -> RCCAuthorizationStatus
     /// Prompts if — and only if — status is `.notDetermined`. Returns the status after
@@ -41,14 +38,23 @@ public protocol CalendarRepository: Sendable {
     func createEvent(_ draft: EventDraft) async throws -> String
     /// Apply a patch to an event and return the saved DTO (with a fresh `version`). A
     /// recurring target requires `scope` (SPEC §9.4); a non-recurring one ignores it.
-    func updateEvent(identifier: String, patch: EventPatch, scope: RecurrenceScope?) async throws -> EventSummary
+    ///
+    /// `occurrenceDate` picks one occurrence of a recurring series. Every occurrence shares
+    /// the series' identifier, so without it EventKit resolves the *first* one — editing
+    /// "this occurrence" would silently edit the wrong day.
+    func updateEvent(
+        identifier: String, occurrenceDate: Date?, patch: EventPatch, scope: RecurrenceScope?
+    ) async throws -> EventSummary
     func events(inCalendar calendarIdentifier: String, from: Date, to: Date) async throws -> [EventSummary]
     /// Events across the given calendars (or every event calendar when `nil`) in a bounded
     /// window. A window longer than four years is walked in ≤4-year chunks — EventKit's
     /// predicate silently truncates one otherwise (SPEC §9.4/§10).
     func listEvents(calendarIdentifiers: [String]?, from: Date, to: Date) async throws -> [EventSummary]
-    func event(withIdentifier identifier: String) async throws -> EventSummary?
-    func deleteEvent(identifier: String) async throws
+    /// One event. With `occurrenceDate`, that specific occurrence of a recurring series, or
+    /// `nil` if the series has no occurrence there — never a different one.
+    func event(withIdentifier identifier: String, occurrenceDate: Date?) async throws -> EventSummary?
+    /// Delete an event; for a recurring one, `scope` decides how much of the series goes.
+    func deleteEvent(identifier: String, occurrenceDate: Date?, scope: RecurrenceScope?) async throws
 
     func createReminder(_ draft: ReminderDraft) async throws -> String
     func updateReminder(identifier: String, patch: ReminderPatch) async throws -> ReminderSummary
@@ -78,6 +84,14 @@ public protocol CalendarRepository: Sendable {
 }
 
 public extension CalendarRepository {
+    func event(withIdentifier identifier: String) async throws -> EventSummary? {
+        try await event(withIdentifier: identifier, occurrenceDate: nil)
+    }
+
+    func deleteEvent(identifier: String) async throws {
+        try await deleteEvent(identifier: identifier, occurrenceDate: nil, scope: nil)
+    }
+
     @discardableResult
     func observeStoreChanges(_ onChange: @escaping @Sendable () -> Void) -> AnyObject? { nil }
 }
@@ -202,19 +216,42 @@ public struct CalendarSummary: Sendable, Equatable, Identifiable {
     public var isWritable: Bool { allowsContentModifications && !isImmutable }
 }
 
+/// Everything a new event can carry. Only the calendar, title, and start/end are
+/// required; the rest default to EventKit's own defaults (SPEC §9.1).
 public struct EventDraft: Sendable, Equatable {
-    public let calendarIdentifier: String
-    public let title: String
-    public let start: Date
-    public let end: Date
-    public let notes: String?
+    public var calendarIdentifier: String
+    public var title: String
+    public var start: Date
+    public var end: Date
+    public var notes: String?
+    public var isAllDay: Bool
+    /// IANA identifier; `nil` uses the system zone (a floating event is not offered).
+    public var timeZoneIdentifier: String?
+    public var location: String?
+    public var url: String?
+    /// busy / free / tentative / unavailable.
+    public var availability: String?
+    public var recurrenceRules: [RecurrenceRule]
+    public var alarms: [AlarmSpec]
 
-    public init(calendarIdentifier: String, title: String, start: Date, end: Date, notes: String? = nil) {
+    public init(
+        calendarIdentifier: String, title: String, start: Date, end: Date, notes: String? = nil,
+        isAllDay: Bool = false, timeZoneIdentifier: String? = nil, location: String? = nil,
+        url: String? = nil, availability: String? = nil,
+        recurrenceRules: [RecurrenceRule] = [], alarms: [AlarmSpec] = []
+    ) {
         self.calendarIdentifier = calendarIdentifier
         self.title = title
         self.start = start
         self.end = end
         self.notes = notes
+        self.isAllDay = isAllDay
+        self.timeZoneIdentifier = timeZoneIdentifier
+        self.location = location
+        self.url = url
+        self.availability = availability
+        self.recurrenceRules = recurrenceRules
+        self.alarms = alarms
     }
 }
 
@@ -306,7 +343,7 @@ public struct EventSummary: Sendable, Equatable, Identifiable {
             ("url", url ?? ""),
             ("availability", availability?.name ?? ""),
             ("recurrence", recurrenceRules.map(\.canonicalString).joined(separator: "|")),
-            ("alarms", alarms.map { "\($0.type.name):\($0.relativeOffset ?? 0)" }.sorted().joined(separator: ",")),
+            ("alarms", alarms.map(\.canonicalString).sorted().joined(separator: ",")),
             ("calendar", calendarIdentifier),
         ]
     }
@@ -357,15 +394,42 @@ public struct ReminderFilter: Sendable, Equatable {
     }
 }
 
+/// Everything a new reminder can carry. Only the list and title are required (SPEC §9.2).
 public struct ReminderDraft: Sendable, Equatable {
-    public let calendarIdentifier: String
-    public let title: String
-    public let notes: String?
+    public var calendarIdentifier: String
+    public var title: String
+    public var notes: String?
+    public var url: String?
+    public var location: String?
+    /// EventKit's raw 0–9 scale (1 high, 5 medium, 9 low, 0 none).
+    public var priorityRaw: Int
+    public var dueDate: ReminderDate?
+    public var startDate: ReminderDate?
+    /// IANA identifier for a timed due/start; `nil` uses the system zone.
+    public var timeZoneIdentifier: String?
+    /// EventKit needs a due date for a recurring reminder; the executor checks.
+    public var recurrenceRules: [RecurrenceRule]
+    /// `nil` applies the default: a timed due date gets an alert at that time, the way
+    /// Reminders.app does it. `[]` means "no alerts", explicitly.
+    public var alarms: [AlarmSpec]?
 
-    public init(calendarIdentifier: String, title: String, notes: String? = nil) {
+    public init(
+        calendarIdentifier: String, title: String, notes: String? = nil, url: String? = nil,
+        location: String? = nil, priorityRaw: Int = 0, dueDate: ReminderDate? = nil,
+        startDate: ReminderDate? = nil, timeZoneIdentifier: String? = nil,
+        recurrenceRules: [RecurrenceRule] = [], alarms: [AlarmSpec]? = nil
+    ) {
         self.calendarIdentifier = calendarIdentifier
         self.title = title
         self.notes = notes
+        self.url = url
+        self.location = location
+        self.priorityRaw = priorityRaw
+        self.dueDate = dueDate
+        self.startDate = startDate
+        self.timeZoneIdentifier = timeZoneIdentifier
+        self.recurrenceRules = recurrenceRules
+        self.alarms = alarms
     }
 }
 
@@ -438,6 +502,7 @@ public struct ReminderSummary: Sendable, Equatable, Identifiable {
             ("start", startDate?.canonicalString ?? ""),
             ("priority", String(priorityRaw)),
             ("recurrence", recurrenceRules.map(\.canonicalString).joined(separator: "|")),
+            ("alarms", alarms.map(\.canonicalString).sorted().joined(separator: ",")),
             ("calendar", calendarIdentifier),
         ]
     }
@@ -449,6 +514,8 @@ public enum CalendarRepositoryError: Error, CustomStringConvertible {
     case notFound(String)
     case readOnly(String)
     case unsupported(String)
+    /// A well-formed request with a value EventKit cannot use (an unknown time zone, say).
+    case invalidArgument(String)
     /// Carries the underlying EventKit error so provider-specific failures stay
     /// diagnosable instead of collapsing into one generic code (SPEC §10.1).
     case native(String, underlying: NSError)
@@ -463,6 +530,8 @@ public enum CalendarRepositoryError: Error, CustomStringConvertible {
             return "Read-only: \(what)"
         case .unsupported(let what):
             return "Unsupported: \(what)"
+        case .invalidArgument(let what):
+            return what
         case .native(let context, let underlying):
             return "\(context): \(underlying.domain) \(underlying.code) — \(underlying.localizedDescription)"
         }
@@ -480,6 +549,7 @@ public enum CalendarRepositoryError: Error, CustomStringConvertible {
         case .notFound: return "not_found"
         case .readOnly: return "read_only"
         case .unsupported: return "unsupported"
+        case .invalidArgument: return "invalid_argument"
         case .native: return "internal"
         }
     }

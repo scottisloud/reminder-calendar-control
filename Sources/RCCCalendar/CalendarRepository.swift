@@ -50,6 +50,13 @@ public protocol CalendarRepository: Sendable {
     /// window. A window longer than four years is walked in ≤4-year chunks — EventKit's
     /// predicate silently truncates one otherwise (SPEC §9.4/§10).
     func listEvents(calendarIdentifiers: [String]?, from: Date, to: Date) async throws -> [EventSummary]
+    /// One page of a filtered event query, plus how many matched in total (SPEC §10).
+    ///
+    /// Exists for cost, not semantics: it must return exactly what `listEvents` + filter +
+    /// slice would, but an adapter can do the filtering and ordering on cheap fields and
+    /// fully convert only the page — the difference between 16 s and well under one for a
+    /// few thousand occurrences in EventKit (docs/milestone-5-findings.md).
+    func queryEvents(_ query: EventQuery) async throws -> QueryPage<EventSummary>
     /// One event. With `occurrenceDate`, that specific occurrence of a recurring series, or
     /// `nil` if the series has no occurrence there — never a different one.
     func event(withIdentifier identifier: String, occurrenceDate: Date?) async throws -> EventSummary?
@@ -66,6 +73,8 @@ public protocol CalendarRepository: Sendable {
     /// one: most reminders have no due date, so a range is optional and, when given,
     /// undated reminders are still included unless excluded explicitly (SPEC §10).
     func listReminders(_ filter: ReminderFilter) async throws -> [ReminderSummary]
+    /// One page of `listReminders(filter)`, plus the total. Same contract as `queryEvents`.
+    func queryReminders(_ filter: ReminderFilter, offset: Int, limit: Int) async throws -> QueryPage<ReminderSummary>
     func reminder(withIdentifier identifier: String) async throws -> ReminderSummary?
     func deleteReminder(identifier: String) async throws
 
@@ -84,6 +93,18 @@ public protocol CalendarRepository: Sendable {
 }
 
 public extension CalendarRepository {
+    /// The reference implementation: everything converted, then filtered and sliced.
+    func queryEvents(_ query: EventQuery) async throws -> QueryPage<EventSummary> {
+        let all = try await listEvents(
+            calendarIdentifiers: query.calendarIdentifiers, from: query.from, to: query.to
+        ).filter(query.matches)
+        return QueryPage(slicing: all, offset: query.offset, limit: query.limit)
+    }
+
+    func queryReminders(_ filter: ReminderFilter, offset: Int, limit: Int) async throws -> QueryPage<ReminderSummary> {
+        QueryPage(slicing: try await listReminders(filter), offset: offset, limit: limit)
+    }
+
     func event(withIdentifier identifier: String) async throws -> EventSummary? {
         try await event(withIdentifier: identifier, occurrenceDate: nil)
     }
@@ -186,6 +207,10 @@ public struct CalendarSummary: Sendable, Equatable, Identifiable {
     public var type: EnumValue?
     /// `busy` / `free` / `tentative` / `unavailable` names the calendar's source supports.
     public var supportedEventAvailabilities: [String]
+    /// EventKit's default destination for new items of this calendar's type
+    /// (`defaultCalendarForNewEvents` / `defaultCalendarForNewReminders()`). Reported so a
+    /// caller can choose it *explicitly* — rcc never falls back to it implicitly (SPEC §10).
+    public var isDefault: Bool = false
 
     public init(
         id: String,
@@ -349,6 +374,79 @@ public struct EventSummary: Sendable, Equatable, Identifiable {
     }
 }
 
+/// A bounded event query with its non-EventKit filters and the page wanted (SPEC §10).
+public struct EventQuery: Sendable, Equatable {
+    public var calendarIdentifiers: [String]?
+    public var from: Date
+    public var to: Date
+    /// Matched against title and location (and notes, with `searchNotes`).
+    public var text: String?
+    public var searchNotes: Bool
+    /// Matched against participant and organizer name, email, or URL.
+    public var attendee: String?
+    public var offset: Int
+    public var limit: Int
+
+    public init(
+        calendarIdentifiers: [String]? = nil, from: Date, to: Date, text: String? = nil,
+        searchNotes: Bool = false, attendee: String? = nil, offset: Int = 0, limit: Int = .max
+    ) {
+        self.calendarIdentifiers = calendarIdentifiers
+        self.from = from
+        self.to = to
+        self.text = text
+        self.searchNotes = searchNotes
+        self.attendee = attendee
+        self.offset = offset
+        self.limit = limit
+    }
+
+    /// The post-fetch filters, applied before paging so page boundaries do not shift
+    /// under a text filter (SPEC §10). Reads only title, location, notes, and
+    /// participants — an adapter need load nothing else to evaluate it.
+    public func matches(_ event: EventSummary) -> Bool {
+        if let text {
+            var haystack = "\(event.title)\n\(event.location ?? "")"
+            if searchNotes { haystack += "\n\(event.notes ?? "")" }
+            if !haystack.localizedCaseInsensitiveContains(text) { return false }
+        }
+        if let attendee {
+            let people = event.participants + [event.organizer].compactMap { $0 }
+            let hit = people.contains { participant in
+                [participant.name, participant.email, participant.url]
+                    .compactMap { $0 }
+                    .contains { $0.localizedCaseInsensitiveContains(attendee) }
+            }
+            if !hit { return false }
+        }
+        return true
+    }
+}
+
+/// A page of results and the size of the whole match.
+public struct QueryPage<Item: Sendable>: Sendable {
+    public var items: [Item]
+    public var totalMatched: Int
+
+    public init(items: [Item], totalMatched: Int) {
+        self.items = items
+        self.totalMatched = totalMatched
+    }
+
+    public init(slicing all: [Item], offset: Int, limit: Int) {
+        self.init(items: Array(all[pageRange(count: all.count, offset: offset, limit: limit)]),
+                  totalMatched: all.count)
+    }
+}
+
+/// The indices of one page of `count` items, clamped — usable on arrays of non-`Sendable`
+/// EventKit objects inside an adapter.
+public func pageRange(count: Int, offset: Int, limit: Int) -> Range<Int> {
+    let start = min(max(0, offset), count)
+    let end = limit >= count - start ? count : start + max(0, limit)
+    return start..<end
+}
+
 /// Filter for `list_reminders` / `search_reminders` (SPEC §10).
 public struct ReminderFilter: Sendable, Equatable {
     public enum Completion: String, Sendable, CaseIterable { case any, incomplete, completed }
@@ -368,6 +466,9 @@ public struct ReminderFilter: Sendable, Equatable {
     public var searchNotes: Bool
     /// Keep only reminders whose priority bucket is at least this (`high` > `medium` > `low`).
     public var minimumPriorityBucket: ReminderPriorityBucket?
+    /// Keep only reminders due in this window, evaluated at `now` in the local zone.
+    public var dueWindow: ReminderDueWindow?
+    public var now: Date = Date()
 
     public init(
         calendarIdentifiers: [String]? = nil,
@@ -391,6 +492,48 @@ public struct ReminderFilter: Sendable, Equatable {
         self.text = text
         self.searchNotes = searchNotes
         self.minimumPriorityBucket = minimumPriorityBucket
+    }
+}
+
+extension ReminderFilter {
+    /// Every filter the reminder contract defines, evaluated on a DTO (SPEC §10). Reads
+    /// only list, completion, title/notes, priority, and due — never alarms or rules — so
+    /// an adapter can evaluate it before paying for a full conversion.
+    public func matches(_ reminder: ReminderSummary) -> Bool {
+        if let calendarIdentifiers, !calendarIdentifiers.contains(reminder.calendarIdentifier) { return false }
+        switch completion {
+        case .any: break
+        case .incomplete: if reminder.isCompleted { return false }
+        case .completed:
+            if !reminder.isCompleted { return false }
+            if let completedFrom, (reminder.completionDate ?? .distantPast) < completedFrom { return false }
+            if let completedTo, (reminder.completionDate ?? .distantFuture) > completedTo { return false }
+        }
+        if let text, !text.isEmpty {
+            let haystack = searchNotes ? "\(reminder.title)\n\(reminder.notes ?? "")" : reminder.title
+            if !haystack.localizedCaseInsensitiveContains(text) { return false }
+        }
+        if let minimumPriorityBucket,
+           ReminderPriorityBucket(raw: reminder.priorityRaw).rank < minimumPriorityBucket.rank {
+            return false
+        }
+        if dueFrom != nil || dueTo != nil {
+            guard let due = reminder.dueDate?.resolvedDate() else { return includeUndated }
+            if let dueFrom, due < dueFrom { return false }
+            if let dueTo, due > dueTo { return false }
+        }
+        if let dueWindow, !dueWindow.matches(reminder.dueDate, now: now) { return false }
+        return true
+    }
+
+    /// The documented, stable order (SPEC §10): incomplete before completed, then due date
+    /// with undated last, then title, then identifier.
+    public static func precedes(_ lhs: ReminderSummary, _ rhs: ReminderSummary) -> Bool {
+        func key(_ r: ReminderSummary) -> (Int, Double, String, String) {
+            (r.isCompleted ? 1 : 0, r.dueDate?.resolvedDate()?.timeIntervalSince1970 ?? .greatestFiniteMagnitude,
+             r.title, r.id)
+        }
+        return key(lhs) < key(rhs)
     }
 }
 

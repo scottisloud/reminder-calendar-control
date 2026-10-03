@@ -65,27 +65,35 @@ public struct Page<Item>: Sendable where Item: Sendable {
         currentGeneration: Int,
         maxLimit: Int = 200
     ) throws {
-        let pageSize = max(1, min(limit, maxLimit))
-
-        let offset: Int
-        if let cursor {
-            guard let decoded = PageCursor.decode(cursor), decoded.offset >= 0 else {
-                throw PaginationError.malformed
-            }
-            guard decoded.generation == currentGeneration else {
-                throw PaginationError.stale
-            }
-            offset = decoded.offset
-        } else {
-            offset = 0
-        }
-
-        totalMatched = all.count
+        let pageSize = Self.pageSize(limit, maxLimit: maxLimit)
+        let offset = try Self.offset(cursor: cursor, currentGeneration: currentGeneration)
         let start = min(offset, all.count)
         let end = min(start + pageSize, all.count)
-        items = Array(all[start..<end])
-        nextCursor = end < all.count
+        self.init(items: Array(all[start..<end]), offset: start, totalMatched: all.count,
+                  currentGeneration: currentGeneration)
+    }
+
+    /// A page the repository already sliced: `items` start at `offset` of `totalMatched`.
+    public init(items: [Item], offset: Int, totalMatched: Int, currentGeneration: Int) {
+        self.items = items
+        self.totalMatched = totalMatched
+        let end = offset + items.count
+        nextCursor = end < totalMatched
             ? PageCursor(offset: end, generation: currentGeneration).encoded()
             : nil
+    }
+
+    public static func pageSize(_ limit: Int, maxLimit: Int = 200) -> Int {
+        max(1, min(limit, maxLimit))
+    }
+
+    /// Where the caller's cursor points, refusing a malformed or stale one.
+    public static func offset(cursor: String?, currentGeneration: Int) throws -> Int {
+        guard let cursor else { return 0 }
+        guard let decoded = PageCursor.decode(cursor), decoded.offset >= 0 else {
+            throw PaginationError.malformed
+        }
+        guard decoded.generation == currentGeneration else { throw PaginationError.stale }
+        return decoded.offset
     }
 }

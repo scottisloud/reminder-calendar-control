@@ -278,29 +278,15 @@ public enum ReadTools {
             throw ToolError(code: "invalid_argument", message: "`search_events` needs `text` or `attendee`")
         }
 
-        var all = try await mapRepositoryError {
-            try await repository.listEvents(calendarIdentifiers: calendarIDs, from: from, to: to)
+        let (offset, pageSize) = try pageWindow(arguments, generation: generation)
+        let result = try await mapRepositoryError {
+            try await repository.queryEvents(EventQuery(
+                calendarIdentifiers: calendarIDs, from: from, to: to, text: text,
+                searchNotes: searchNotes, attendee: attendee, offset: offset, limit: pageSize
+            ))
         }
-        // Non-EventKit-native filters, applied before page construction so page semantics
-        // do not shift under a text filter (SPEC §10).
-        if let text {
-            all = all.filter { event in
-                var haystack = "\(event.title)\n\(event.location ?? "")"
-                if searchNotes { haystack += "\n\(event.notes ?? "")" }
-                return haystack.localizedCaseInsensitiveContains(text)
-            }
-        }
-        if let attendee {
-            all = all.filter { event in
-                (event.participants + [event.organizer].compactMap { $0 }).contains { participant in
-                    [participant.name, participant.email, participant.url]
-                        .compactMap { $0 }
-                        .contains { $0.localizedCaseInsensitiveContains(attendee) }
-                }
-            }
-        }
-
-        let page = try paginate(all, arguments: arguments, generation: generation)
+        let page = Page(items: result.items, offset: offset, totalMatched: result.totalMatched,
+                        currentGeneration: generation)
         let titles = await resolver.titles()
         return envelope(
             data: page.items.map { event in
@@ -371,7 +357,6 @@ public enum ReadTools {
         filter.calendarIdentifiers = try await resolver.resolveFilter(
             stringArray(arguments["calendar_ids"]), entity: .reminder
         )
-        var window: ReminderDueWindow?
         if let raw = string(arguments["due_window"]) {
             guard let parsed = ReminderDueWindow(rawValue: raw) else {
                 throw ToolError(
@@ -379,7 +364,7 @@ public enum ReadTools {
                     message: "`due_window` must be one of \(ReminderDueWindow.allCases.map(\.rawValue))"
                 )
             }
-            window = parsed
+            filter.dueWindow = parsed
             // "What's due" means what is still to do, unless the caller asked otherwise.
             if arguments["completion"] == nil { filter.completion = .incomplete }
         }
@@ -407,12 +392,12 @@ public enum ReadTools {
         }
         let detail = bool(arguments["include_details"]) ?? false
 
-        var all = try await mapRepositoryError { try await repository.listReminders(filter) }
-        if let window {
-            let now = Date()
-            all = all.filter { window.matches($0.dueDate, now: now) }
+        let (offset, pageSize) = try pageWindow(arguments, generation: generation)
+        let result = try await mapRepositoryError {
+            try await repository.queryReminders(filter, offset: offset, limit: pageSize)
         }
-        let page = try paginate(all, arguments: arguments, generation: generation)
+        let page = Page(items: result.items, offset: offset, totalMatched: result.totalMatched,
+                        currentGeneration: generation)
         let titles = await resolver.titles()
         return envelope(
             data: page.items.map { reminder in
@@ -446,6 +431,22 @@ public enum ReadTools {
     }
 
     // MARK: - Pagination glue
+
+    /// The offset and page size a list call asks for, with cursor errors mapped onto the
+    /// SPEC §10.1 codes.
+    private static func pageWindow(_ arguments: [String: Any], generation: Int) throws -> (Int, Int) {
+        let size = Page<Int>.pageSize(int(arguments["limit"]) ?? 50)
+        do {
+            return (try Page<Int>.offset(cursor: string(arguments["cursor"]), currentGeneration: generation), size)
+        } catch PaginationError.malformed {
+            throw ToolError(code: "invalid_argument", message: "`cursor` is not a valid cursor")
+        } catch {
+            throw ToolError(
+                code: "cursor_stale",
+                message: "the calendar store changed since this cursor was issued; re-query from the start"
+            )
+        }
+    }
 
     private static func paginate<Item: Sendable>(
         _ all: [Item], arguments: [String: Any], generation: Int
@@ -514,6 +515,7 @@ public enum ReadTools {
             "source_id": calendar.sourceIdentifier as Any? ?? NSNull(),
             "source_title": calendar.sourceTitle as Any? ?? NSNull(),
         ]
+        if calendar.isDefault { out["is_default"] = true }
         if let color = calendar.colorHex { out["color"] = color }
         if let type = calendar.type { out["type"] = enumValue(type) }
         if !calendar.supportedEventAvailabilities.isEmpty {

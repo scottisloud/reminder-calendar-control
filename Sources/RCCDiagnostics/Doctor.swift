@@ -511,6 +511,8 @@ public struct Doctor: Sendable {
                 title: "Local state database",
                 status: .fail,
                 detail: error.localizedDescription,
+                remediation: "Re-run `rcc doctor`; if it persists, another process may hold the database "
+                    + "(quit Claude Desktop and retry), or re-run `rcc setup`.",
                 facts: ["path": path]
             )
         }

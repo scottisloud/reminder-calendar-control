@@ -7,7 +7,7 @@ import Testing
 @testable import RCCCore
 @testable import RCCDiagnostics
 
-@Suite("Doctor")
+@Suite("Doctor", .serialized)  // tests share the sandbox state database
 struct DoctorTests {
     private func check(_ report: HealthReport, _ id: String) throws -> HealthReport.Check {
         try #require(report.checks.first { $0.id == id })

@@ -483,33 +483,7 @@ public actor InMemoryCalendarRepository: CalendarRepository {
 
     public func listReminders(_ filter: ReminderFilter) async throws -> [ReminderSummary] {
         try requireAccess(.reminder)
-        let allowed = filter.calendarIdentifiers.map(Set.init)
-        return storedReminders.values
-            .filter { reminder in
-                if let allowed, !allowed.contains(reminder.calendarIdentifier) { return false }
-                switch filter.completion {
-                case .any: break
-                case .incomplete: if reminder.isCompleted { return false }
-                case .completed: if !reminder.isCompleted { return false }
-                }
-                if let text = filter.text, !text.isEmpty {
-                    let haystack = filter.searchNotes
-                        ? "\(reminder.title)\n\(reminder.notes ?? "")"
-                        : reminder.title
-                    if !haystack.localizedCaseInsensitiveContains(text) { return false }
-                }
-                if let minimum = filter.minimumPriorityBucket,
-                   ReminderPriorityBucket(raw: reminder.priorityRaw).rank < minimum.rank {
-                    return false
-                }
-                if filter.dueFrom != nil || filter.dueTo != nil {
-                    guard let due = reminder.dueDate?.resolvedDate() else { return filter.includeUndated }
-                    if let lower = filter.dueFrom, due < lower { return false }
-                    if let upper = filter.dueTo, due > upper { return false }
-                }
-                return true
-            }
-            .sorted { ($0.title, $0.id) < ($1.title, $1.id) }
+        return storedReminders.values.filter(filter.matches).sorted(by: ReminderFilter.precedes)
     }
 
     public func reminder(withIdentifier identifier: String) async throws -> ReminderSummary? {

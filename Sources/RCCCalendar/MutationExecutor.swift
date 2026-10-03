@@ -203,6 +203,7 @@ public struct MutationExecutor: Sendable {
             guard !patch.isEmpty else { throw ExecutorError.emptyPatch }
             let target = try await resolveTarget(request, entity: .event)
             let before = try await requireEvent(target)
+            try refuseIfInvitation(before)
             try check(ifMatch: request.ifMatch, against: before.version)
             if before.isRecurring {
                 guard let scope = request.recurrenceScope else { throw ExecutorError.recurrenceScopeRequired }
@@ -239,6 +240,7 @@ public struct MutationExecutor: Sendable {
         case .deleteEvent:
             let target = try await resolveTarget(request, entity: .event)
             let before = try await requireEvent(target)
+            try refuseIfInvitation(before)
             try check(ifMatch: request.ifMatch, against: before.version)
             if before.isRecurring, request.recurrenceScope == nil {
                 throw ExecutorError.recurrenceScopeRequired
@@ -382,6 +384,23 @@ public struct MutationExecutor: Sendable {
             throw ExecutorError.bareIdentifierRejectedForRecurring
         }
         return Target(identifier: identifier)
+    }
+
+    /// An event someone else organised, that the user was invited to, is not theirs to
+    /// edit or delete through rcc (SPEC §8.4, §12). On CalDAV and Exchange, deleting an
+    /// invitation can send the organiser a decline and an edit can send a counter-proposal
+    /// — a participation-status write by another route, which public EventKit does not let
+    /// rcc do deliberately and which it must not do by accident. Claude for iOS documents
+    /// the same line: edit only events you organised.
+    private func refuseIfInvitation(_ event: EventSummary) throws {
+        guard let organizer = event.organizer, !organizer.isCurrentUser,
+              event.participants.contains(where: \.isCurrentUser)
+        else { return }
+        throw ExecutorError.unsupported(
+            "this is an invitation from \(organizer.name ?? organizer.email ?? "someone else"); "
+                + "rcc does not edit or delete events you did not organise, because that can send "
+                + "the organiser a reply. Change it in Calendar instead."
+        )
     }
 
     private func requireEvent(_ target: Target) async throws -> EventSummary {

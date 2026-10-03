@@ -127,4 +127,19 @@ struct DevFixtureTests {
         // Removing again is a no-op, not an error.
         try await manager.remove(.reminder)
     }
+
+    /// Uninstall leaves the fixture calendars in the user's account; a purge-and-reinstall
+    /// must pick them back up instead of stranding them beside fresh ones.
+    @Test("With no record, an existing rcc dev calendar is adopted rather than duplicated")
+    func adoptsExistingFixture() async throws {
+        let repository = makeRepository()
+        let original = try await DevFixtureManager(repository: repository, store: try makeStore())
+            .provision(.event)
+
+        let fresh = try makeStore()  // state purged
+        let adopted = try await DevFixtureManager(repository: repository, store: fresh).provision(.event)
+        #expect(adopted.calendarID == original.calendarID)
+        #expect(try fresh.devFixture(.event)?.calendarID == original.calendarID)
+        #expect(try await repository.calendars(for: .event).count == 1)
+    }
 }

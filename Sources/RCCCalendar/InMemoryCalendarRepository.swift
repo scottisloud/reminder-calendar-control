@@ -39,6 +39,10 @@ public actor InMemoryCalendarRepository: CalendarRepository {
     /// Incremented by `reset()` so tests can assert the store really was recreated after
     /// an authorization change (SPEC §6.2).
     public private(set) var resetCount = 0
+    /// The fake keeps one row per series, so it records which occurrence and scope a
+    /// mutation targeted for tests to assert on, rather than modelling expansion.
+    public private(set) var lastTargetedOccurrence: Date?
+    public private(set) var lastEventScope: RecurrenceScope?
 
     public init(scenario: Scenario = Scenario(), sources: [SourceSummary]? = nil) {
         self.scenario = scenario
@@ -204,13 +208,24 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         try requireAccess(.event)
         try consumeInjectedFailure()
         let calendar = try writableCalendar(draft.calendarIdentifier, entityType: .event)
+        if let zone = draft.timeZoneIdentifier, TimeZone(identifier: zone) == nil {
+            throw CalendarRepositoryError.invalidArgument("unknown time zone '\(zone)'")
+        }
         var event = EventSummary(
             id: mintIdentifier("evt"),
             title: draft.title,
             start: draft.start,
             end: draft.end,
             calendarIdentifier: calendar.id,
+            isAllDay: draft.isAllDay,
+            timeZoneIdentifier: draft.timeZoneIdentifier ?? TimeZone.current.identifier,
+            location: draft.location,
             notes: draft.notes,
+            url: draft.url,
+            availability: draft.availability.map { EnumValue(name: $0, raw: -1) },
+            isRecurring: !draft.recurrenceRules.isEmpty,
+            recurrenceRules: draft.recurrenceRules,
+            alarms: draft.alarms.map(Self.alarm),
             sourceIdentifier: calendar.sourceIdentifier
         )
         event.version = ContentVersion.make(event.contentFields)
@@ -226,19 +241,25 @@ public actor InMemoryCalendarRepository: CalendarRepository {
     }
 
     public func updateEvent(
-        identifier: String, patch: EventPatch, scope: RecurrenceScope?
+        identifier: String, occurrenceDate: Date?, patch: EventPatch, scope: RecurrenceScope?
     ) async throws -> EventSummary {
         try requireAccess(.event)
         try consumeInjectedFailure()
         guard let current = storedEvents[identifier] else {
             throw CalendarRepositoryError.notFound("event \(identifier)")
         }
+        lastTargetedOccurrence = occurrenceDate
+        lastEventScope = scope
+        var calendarID = current.calendarIdentifier
+        if case .set(let target) = patch.calendarIdentifier {
+            calendarID = try writableCalendar(target, entityType: .event).id
+        }
         var event = EventSummary(
             id: current.id,
             title: patch.title.isChange ? (patch.title.resolved(from: current.title) ?? "") : current.title,
             start: { if case .set(let value) = patch.start { return value } else { return current.start } }(),
             end: { if case .set(let value) = patch.end { return value } else { return current.end } }(),
-            calendarIdentifier: current.calendarIdentifier
+            calendarIdentifier: calendarID
         )
         event.isAllDay = { if case .set(let value) = patch.isAllDay { return value } else { return current.isAllDay } }()
         event.location = patch.location.resolved(from: current.location)
@@ -248,8 +269,11 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         event.availability = { if case .set(let name) = patch.availability {
             return EnumValue(name: name, raw: -1)
         } else { return current.availability } }()
-        event.isRecurring = current.isRecurring
-        event.recurrenceRules = current.recurrenceRules
+        event.recurrenceRules = patch.recurrenceRules.resolved(from: current.recurrenceRules) ?? []
+        event.isRecurring = !event.recurrenceRules.isEmpty
+        event.alarms = patch.alarms.isChange
+            ? (patch.alarms.resolved(from: nil) ?? []).map(Self.alarm) : current.alarms
+        event.occurrenceDate = current.occurrenceDate
         event.sourceIdentifier = current.sourceIdentifier
         event.version = ContentVersion.make(event.contentFields)
         storedEvents[identifier] = event
@@ -269,14 +293,18 @@ public actor InMemoryCalendarRepository: CalendarRepository {
             .sorted { ($0.start, $0.id) < ($1.start, $1.id) }
     }
 
-    public func event(withIdentifier identifier: String) async throws -> EventSummary? {
+    public func event(withIdentifier identifier: String, occurrenceDate: Date?) async throws -> EventSummary? {
         try requireAccess(.event)
         return storedEvents[identifier]
     }
 
-    public func deleteEvent(identifier: String) async throws {
+    public func deleteEvent(
+        identifier: String, occurrenceDate: Date?, scope: RecurrenceScope?
+    ) async throws {
         try requireAccess(.event)
         try consumeInjectedFailure()
+        lastTargetedOccurrence = occurrenceDate
+        lastEventScope = scope
         guard storedEvents.removeValue(forKey: identifier) != nil else {
             throw CalendarRepositoryError.notFound("event \(identifier)")
         }
@@ -288,12 +316,26 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         try requireAccess(.reminder)
         try consumeInjectedFailure()
         let calendar = try writableCalendar(draft.calendarIdentifier, entityType: .reminder)
+        let zoneName = draft.timeZoneIdentifier ?? TimeZone.current.identifier
+        guard let zone = TimeZone(identifier: zoneName) else {
+            throw CalendarRepositoryError.invalidArgument("unknown time zone '\(zoneName)'")
+        }
+        let alarms = draft.alarms ?? ReminderAlertDefaults.forNewReminder(due: draft.dueDate)
         var reminder = ReminderSummary(
             id: mintIdentifier("rem"),
             title: draft.title,
             isCompleted: false,
             calendarIdentifier: calendar.id,
             notes: draft.notes,
+            url: draft.url,
+            location: draft.location,
+            timeZoneIdentifier: zoneName,
+            dueDate: draft.dueDate.map { DateComponentsDTO($0.dateComponents(zone: zone)) },
+            startDate: draft.startDate.map { DateComponentsDTO($0.dateComponents(zone: zone)) },
+            priorityRaw: max(0, min(9, draft.priorityRaw)),
+            priorityBucket: ReminderPriorityBucket(raw: draft.priorityRaw).rawValue,
+            recurrenceRules: draft.recurrenceRules,
+            alarms: alarms.map(Self.alarm),
             sourceIdentifier: calendar.sourceIdentifier
         )
         reminder.version = ContentVersion.make(reminder.contentFields)
@@ -316,11 +358,15 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         guard let current = storedReminders[identifier] else {
             throw CalendarRepositoryError.notFound("reminder \(identifier)")
         }
+        var calendarID = current.calendarIdentifier
+        if case .set(let target) = patch.calendarIdentifier {
+            calendarID = try writableCalendar(target, entityType: .reminder).id
+        }
         var reminder = ReminderSummary(
             id: current.id,
             title: patch.title.isChange ? (patch.title.resolved(from: current.title) ?? "") : current.title,
             isCompleted: current.isCompleted,
-            calendarIdentifier: current.calendarIdentifier
+            calendarIdentifier: calendarID
         )
         reminder.notes = patch.notes.resolved(from: current.notes)
         reminder.url = patch.url.resolved(from: current.url)
@@ -332,10 +378,13 @@ public actor InMemoryCalendarRepository: CalendarRepository {
             reminder.priorityRaw = current.priorityRaw
         }
         reminder.priorityBucket = ReminderPriorityBucket(raw: reminder.priorityRaw).rawValue
-        reminder.dueDate = dateComponents(patch.dueDate, current: current.dueDate)
-        reminder.startDate = dateComponents(patch.startDate, current: current.startDate)
+        let zone = current.timeZoneIdentifier.flatMap(TimeZone.init(identifier:)) ?? .current
+        reminder.dueDate = dateComponents(patch.dueDate, current: current.dueDate, zone: zone)
+        reminder.startDate = dateComponents(patch.startDate, current: current.startDate, zone: zone)
         reminder.completionDate = current.completionDate
-        reminder.recurrenceRules = current.recurrenceRules
+        reminder.recurrenceRules = patch.recurrenceRules.resolved(from: current.recurrenceRules) ?? []
+        reminder.alarms = patch.alarms.isChange
+            ? (patch.alarms.resolved(from: nil) ?? []).map(Self.alarm) : current.alarms
         reminder.sourceIdentifier = current.sourceIdentifier
         reminder.version = ContentVersion.make(reminder.contentFields)
         storedReminders[identifier] = reminder
@@ -343,16 +392,44 @@ public actor InMemoryCalendarRepository: CalendarRepository {
     }
 
     private func dateComponents(
-        _ patch: FieldPatch<Date>, current: DateComponentsDTO?
+        _ patch: FieldPatch<ReminderDate>, current: DateComponentsDTO?, zone: TimeZone
     ) -> DateComponentsDTO? {
         switch patch {
         case .unchanged: return current
         case .clear: return nil
-        case .set(let date):
-            let parts = Calendar.current.dateComponents(
-                [.year, .month, .day, .hour, .minute, .second], from: date
-            )
-            return DateComponentsDTO(parts)
+        case .set(let value): return DateComponentsDTO(value.dateComponents(zone: zone))
+        }
+    }
+
+    private static func advance(_ due: DateComponentsDTO, by rule: RecurrenceRule) -> DateComponentsDTO {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = due.timeZoneIdentifier.flatMap(TimeZone.init(identifier:)) ?? .current
+        guard let date = due.resolvedDate(defaultZone: calendar.timeZone) else { return due }
+        let component: Calendar.Component = switch rule.frequency {
+        case .daily: .day
+        case .weekly: .weekOfYear
+        case .monthly: .month
+        case .yearly: .year
+        }
+        let next = calendar.date(byAdding: component, value: max(1, rule.interval), to: date) ?? date
+        let parts = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: next)
+        let hasTime = due.hour != nil
+        return DateComponentsDTO(
+            year: parts.year, month: parts.month, day: parts.day,
+            hour: hasTime ? parts.hour : nil, minute: hasTime ? parts.minute : nil,
+            second: hasTime ? parts.second : nil, timeZoneIdentifier: due.timeZoneIdentifier
+        )
+    }
+
+    /// The read DTO EventKit would report for a written alarm (a display alarm).
+    static func alarm(_ spec: AlarmSpec) -> Alarm {
+        switch spec {
+        case .relative(let offset):
+            return Alarm(type: EnumValue(name: "display", raw: 0), relativeOffset: offset,
+                         absoluteDate: nil, structuredLocation: nil, proximity: nil)
+        case .absolute(let date):
+            return Alarm(type: EnumValue(name: "display", raw: 0), relativeOffset: nil,
+                         absoluteDate: date, structuredLocation: nil, proximity: nil)
         }
     }
 
@@ -364,6 +441,25 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         guard let current = storedReminders[identifier] else {
             throw CalendarRepositoryError.notFound("reminder \(identifier)")
         }
+        // EventKit's behaviour for a repeating reminder, modelled: the completed occurrence
+        // becomes a new, completed reminder, and this one advances to its next due date and
+        // stays incomplete. (Simplified to frequency × interval from the current due.)
+        if completed, let rule = current.recurrenceRules.first, let due = current.dueDate {
+            var done = ReminderSummary(
+                id: mintIdentifier("rem"), title: current.title, isCompleted: true,
+                calendarIdentifier: current.calendarIdentifier, notes: current.notes,
+                dueDate: current.dueDate, completionDate: Date(), priorityRaw: current.priorityRaw,
+                priorityBucket: current.priorityBucket, sourceIdentifier: current.sourceIdentifier
+            )
+            done.version = ContentVersion.make(done.contentFields)
+            storedReminders[done.id] = done
+
+            var advanced = current
+            advanced.dueDate = Self.advance(due, by: rule)
+            advanced.version = ContentVersion.make(advanced.contentFields)
+            storedReminders[identifier] = advanced
+            return advanced
+        }
         var reminder = ReminderSummary(
             id: current.id, title: current.title, isCompleted: completed,
             calendarIdentifier: current.calendarIdentifier
@@ -371,10 +467,13 @@ public actor InMemoryCalendarRepository: CalendarRepository {
         reminder.notes = current.notes
         reminder.url = current.url
         reminder.location = current.location
+        reminder.timeZoneIdentifier = current.timeZoneIdentifier
         reminder.dueDate = current.dueDate
+        reminder.startDate = current.startDate
         reminder.priorityRaw = current.priorityRaw
         reminder.priorityBucket = current.priorityBucket
         reminder.recurrenceRules = current.recurrenceRules
+        reminder.alarms = current.alarms
         reminder.sourceIdentifier = current.sourceIdentifier
         reminder.completionDate = completed ? Date() : nil
         reminder.version = ContentVersion.make(reminder.contentFields)
@@ -403,9 +502,10 @@ public actor InMemoryCalendarRepository: CalendarRepository {
                    ReminderPriorityBucket(raw: reminder.priorityRaw).rank < minimum.rank {
                     return false
                 }
-                // The fake never sets due dates, so every reminder here is undated.
-                if (filter.dueFrom != nil || filter.dueTo != nil), !filter.includeUndated {
-                    return false
+                if filter.dueFrom != nil || filter.dueTo != nil {
+                    guard let due = reminder.dueDate?.resolvedDate() else { return filter.includeUndated }
+                    if let lower = filter.dueFrom, due < lower { return false }
+                    if let upper = filter.dueTo, due > upper { return false }
                 }
                 return true
             }

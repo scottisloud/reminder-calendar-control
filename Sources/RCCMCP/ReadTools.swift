@@ -58,7 +58,7 @@ public enum ReadTools {
             "from": ["type": "string", "description": "Window start, RFC 3339."],
             "to": ["type": "string", "description": "Window end, RFC 3339."],
             "calendar_ids": ["type": "array", "items": ["type": "string"],
-                             "description": "Restrict to these calendars; omit for all."],
+                             "description": "Restrict to these calendars (ids or names); omit for all."],
             "text": ["type": "string", "description": "Match against title and location."],
             "search_notes": ["type": "boolean", "description": "Also match `text` against notes."],
             "attendee": ["type": "string", "description": "Match a participant name, email, or URL."],
@@ -113,24 +113,34 @@ public enum ReadTools {
             ],
             [
                 "name": getEvent,
-                "description": "Get one event by identifier, with full detail (notes, attendees, alarms, recurrence).",
+                "description": """
+                    Get one event with full detail (notes, attendees, alarms, recurrence). \
+                    For one occurrence of a recurring event pass its `locator` from \
+                    list_events (or `event_id` + `occurrence_date`); `event_id` alone returns \
+                    the series' first occurrence.
+                    """,
                 "inputSchema": schema([
                     "event_id": ["type": "string"],
-                ], required: ["event_id"]),
+                    "occurrence_date": ["type": "string", "description": "RFC 3339; the occurrence's `occurrence_date`."],
+                    "locator": ["type": "string"],
+                ]),
                 "annotations": readOnly("Get Event"),
             ],
             [
                 "name": listReminders,
                 "description": """
-                    List reminders across lists. All filters optional: `completion` \
-                    ('any'|'incomplete'|'completed'), `calendar_ids`, a `due_from`/`due_to` \
-                    range (undated reminders are still included unless `include_undated` is \
-                    false), `completed_from`/`completed_to`, `text` (+ `search_notes`), and \
-                    `minimum_priority` ('low'|'medium'|'high').
+                    List reminders across lists, soonest due first. All filters optional: \
+                    `due_window` ('overdue' | 'today' | 'overdue_or_today' | 'next_7_days', \
+                    in local time, day-only reminders counted by their day), `completion` \
+                    ('any'|'incomplete'|'completed'), `calendar_ids` (list ids or names), a \
+                    `due_from`/`due_to` range (undated reminders are still included unless \
+                    `include_undated` is false), `completed_from`/`completed_to`, `text` \
+                    (+ `search_notes`), and `minimum_priority` ('low'|'medium'|'high').
                     """,
                 "inputSchema": schema([
+                    "due_window": ["type": "string", "enum": ReminderDueWindow.allCases.map(\.rawValue)],
                     "completion": ["type": "string", "enum": ["any", "incomplete", "completed"]],
-                    "calendar_ids": ["type": "array", "items": ["type": "string"]],
+                    "calendar_ids": ["type": "array", "items": ["type": "string"], "description": "List ids or names."],
                     "due_from": ["type": "string", "description": "RFC 3339."],
                     "due_to": ["type": "string", "description": "RFC 3339."],
                     "completed_from": ["type": "string", "description": "RFC 3339."],
@@ -162,7 +172,7 @@ public enum ReadTools {
             ],
             [
                 "name": getReminder,
-                "description": "Get one reminder by identifier, with full detail.",
+                "description": "Get one reminder by identifier, with full detail (notes, alerts, repeat rule).",
                 "inputSchema": schema([
                     "reminder_id": ["type": "string"],
                 ], required: ["reminder_id"]),
@@ -190,9 +200,9 @@ public enum ReadTools {
         case listReminderLists:
             return try await runListCalendars(arguments, repository, forcedEntity: .reminder)
         case listEvents:
-            return try await runListEvents(arguments, repository, generation, requireQuery: false)
+            return try await runListEvents(arguments, repository, store, generation, requireQuery: false)
         case searchEvents:
-            return try await runListEvents(arguments, repository, generation, requireQuery: true)
+            return try await runListEvents(arguments, repository, store, generation, requireQuery: true)
         case getEvent:
             return try await runGetEvent(arguments, repository, store)
         case listReminders:
@@ -248,6 +258,7 @@ public enum ReadTools {
     private static func runListEvents(
         _ arguments: [String: Any],
         _ repository: any CalendarRepository,
+        _ store: Store?,
         _ generation: Int,
         requireQuery: Bool
     ) async throws -> [String: Any] {
@@ -257,13 +268,14 @@ public enum ReadTools {
         guard to > from else {
             throw ToolError(code: "invalid_datetime", message: "`to` must be after `from`")
         }
-        let calendarIDs = stringArray(arguments["calendar_ids"])
+        let resolver = CalendarResolver(repository: repository)
+        let calendarIDs = try await resolver.resolveFilter(stringArray(arguments["calendar_ids"]), entity: .event)
         let detail = bool(arguments["include_details"]) ?? false
         let text = string(arguments["text"])
         let searchNotes = bool(arguments["search_notes"]) ?? false
         let attendee = string(arguments["attendee"])
         if requireQuery, text == nil, attendee == nil {
-            throw ToolError(code: "invalid_datetime", message: "`search_events` needs `text` or `attendee`")
+            throw ToolError(code: "invalid_argument", message: "`search_events` needs `text` or `attendee`")
         }
 
         var all = try await mapRepositoryError {
@@ -289,8 +301,21 @@ public enum ReadTools {
         }
 
         let page = try paginate(all, arguments: arguments, generation: generation)
+        let titles = await resolver.titles()
         return envelope(
-            data: page.items.map { project(event: $0, detail: detail) },
+            data: page.items.map { event in
+                var row = project(event: event, detail: detail)
+                row["calendar_title"] = titles[event.calendarIdentifier] as Any? ?? NSNull()
+                // Every occurrence of a series shares one `id`; the locator is what lets a
+                // later write (or get_event) reach *this* occurrence (SPEC §9.4).
+                if event.isRecurring || event.isDetached, let handle = locatorHandle(
+                    for: .event, calendarID: event.calendarIdentifier, sourceID: event.sourceIdentifier,
+                    identifier: event.id, recurringOccurrence: event.occurrenceDate, store: store
+                ) {
+                    row["locator"] = handle
+                }
+                return row
+            },
             pagination: paginationBlock(page)
         )
     }
@@ -300,17 +325,33 @@ public enum ReadTools {
         _ repository: any CalendarRepository,
         _ store: Store?
     ) async throws -> [String: Any] {
-        guard let id = string(arguments["event_id"]) else {
-            throw ToolError(code: "invalid_datetime", message: "`event_id` is required")
+        var id = string(arguments["event_id"])
+        var occurrence = date(arguments["occurrence_date"])
+        if arguments["occurrence_date"] != nil, occurrence == nil {
+            throw ToolError(code: "invalid_datetime", message: "`occurrence_date` must be RFC 3339")
         }
-        guard let event = try await mapRepositoryError({ try await repository.event(withIdentifier: id) })
-        else {
-            throw ToolError(code: "not_found", message: "no event with identifier \(id)")
+        if let handle = string(arguments["locator"]) {
+            guard let store, case .ok(let locator)? = try? store.resolveLocator(handle) else {
+                throw ToolError(code: "not_found", message: "that locator is not recognised or has expired")
+            }
+            id = locator.itemIdentifier
+            occurrence = locator.occurrenceDate.flatMap(RCCTime.parse)
+        }
+        guard let id else {
+            throw ToolError(code: "invalid_argument", message: "pass `event_id` or `locator`")
+        }
+        guard let event = try await mapRepositoryError({
+            try await repository.event(withIdentifier: id, occurrenceDate: occurrence)
+        }) else {
+            throw ToolError(code: "not_found", message: occurrence == nil
+                ? "no event with identifier \(id)"
+                : "event \(id) has no occurrence at \(RCCTime.instant(occurrence!))")
         }
         var payload = project(event: event, detail: true)
         payload["locator"] = locatorHandle(
             for: .event, calendarID: event.calendarIdentifier, sourceID: event.sourceIdentifier,
-            identifier: id, recurringOccurrence: event.isRecurring ? event.occurrenceDate : nil,
+            identifier: id,
+            recurringOccurrence: event.isRecurring || event.isDetached ? event.occurrenceDate : nil,
             store: store
         ) as Any? ?? NSNull()
         return envelope(data: payload)
@@ -323,14 +364,29 @@ public enum ReadTools {
         requireQuery: Bool
     ) async throws -> [String: Any] {
         if requireQuery, string(arguments["text"]) == nil {
-            throw ToolError(code: "invalid_datetime", message: "`search_reminders` needs `text`")
+            throw ToolError(code: "invalid_argument", message: "`search_reminders` needs `text`")
         }
+        let resolver = CalendarResolver(repository: repository)
         var filter = ReminderFilter()
-        filter.calendarIdentifiers = stringArray(arguments["calendar_ids"])
+        filter.calendarIdentifiers = try await resolver.resolveFilter(
+            stringArray(arguments["calendar_ids"]), entity: .reminder
+        )
+        var window: ReminderDueWindow?
+        if let raw = string(arguments["due_window"]) {
+            guard let parsed = ReminderDueWindow(rawValue: raw) else {
+                throw ToolError(
+                    code: "invalid_argument",
+                    message: "`due_window` must be one of \(ReminderDueWindow.allCases.map(\.rawValue))"
+                )
+            }
+            window = parsed
+            // "What's due" means what is still to do, unless the caller asked otherwise.
+            if arguments["completion"] == nil { filter.completion = .incomplete }
+        }
         if let raw = string(arguments["completion"]) {
             guard let parsed = ReminderFilter.Completion(rawValue: raw) else {
                 throw ToolError(
-                    code: "invalid_datetime",
+                    code: "invalid_argument",
                     message: "`completion` must be one of \(ReminderFilter.Completion.allCases.map(\.rawValue))"
                 )
             }
@@ -344,14 +400,26 @@ public enum ReadTools {
         filter.text = string(arguments["text"])
         filter.searchNotes = bool(arguments["search_notes"]) ?? false
         if let raw = string(arguments["minimum_priority"]) {
-            filter.minimumPriorityBucket = ReminderPriorityBucket(rawValue: raw)
+            guard let bucket = ReminderPriorityBucket(rawValue: raw), bucket != .none else {
+                throw ToolError(code: "invalid_argument", message: "`minimum_priority` must be low, medium, or high")
+            }
+            filter.minimumPriorityBucket = bucket
         }
         let detail = bool(arguments["include_details"]) ?? false
 
-        let all = try await mapRepositoryError { try await repository.listReminders(filter) }
+        var all = try await mapRepositoryError { try await repository.listReminders(filter) }
+        if let window {
+            let now = Date()
+            all = all.filter { window.matches($0.dueDate, now: now) }
+        }
         let page = try paginate(all, arguments: arguments, generation: generation)
+        let titles = await resolver.titles()
         return envelope(
-            data: page.items.map { project(reminder: $0, detail: detail) },
+            data: page.items.map { reminder in
+                var row = project(reminder: reminder, detail: detail)
+                row["list_title"] = titles[reminder.calendarIdentifier] as Any? ?? NSNull()
+                return row
+            },
             pagination: paginationBlock(page)
         )
     }
@@ -362,7 +430,7 @@ public enum ReadTools {
         _ store: Store?
     ) async throws -> [String: Any] {
         guard let id = string(arguments["reminder_id"]) else {
-            throw ToolError(code: "invalid_datetime", message: "`reminder_id` is required")
+            throw ToolError(code: "invalid_argument", message: "`reminder_id` is required")
         }
         guard let reminder = try await mapRepositoryError({
             try await repository.reminder(withIdentifier: id)
@@ -389,7 +457,7 @@ public enum ReadTools {
                 currentGeneration: generation
             )
         } catch PaginationError.malformed {
-            throw ToolError(code: "invalid_datetime", message: "`cursor` is not a valid cursor")
+            throw ToolError(code: "invalid_argument", message: "`cursor` is not a valid cursor")
         } catch PaginationError.stale {
             throw ToolError(
                 code: "cursor_stale",
@@ -466,6 +534,12 @@ public enum ReadTools {
             "version": event.version,
         ]
         if let tz = event.timeZoneIdentifier { out["time_zone"] = tz }
+        if event.isAllDay {
+            // An all-day event's instants are local midnights, which read as the wrong day
+            // in UTC. Its dates are what anyone means by it.
+            out["start_date"] = RCCTime.localDay(event.start)
+            out["end_date"] = RCCTime.localDay(event.end)
+        }
         if let location = event.location { out["location"] = location }
         if let status = event.status { out["status"] = enumValue(status) }
         if let availability = event.availability { out["availability"] = enumValue(availability) }
@@ -593,6 +667,16 @@ public enum ReadTools {
         return out
     }
 
+    /// `2026-10-12`, or `2026-10-12 09:30 America/Vancouver` — for human-readable notes.
+    static func describe(components: DateComponentsDTO) -> String {
+        var out = String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
+        if let hour = components.hour {
+            out += String(format: " %02d:%02d", hour, components.minute ?? 0)
+            if let zone = components.timeZoneIdentifier { out += " \(zone)" }
+        }
+        return out
+    }
+
     private static func enumValue(_ value: EnumValue) -> [String: Any] {
         ["name": value.name, "raw": value.raw]
     }
@@ -631,12 +715,12 @@ public enum ReadTools {
     private static func optionalEntity(_ value: Any?) throws -> RCCEntityType? {
         guard let raw = string(value) else { return nil }
         guard let entity = RCCEntityType(rawValue: raw) else {
-            throw ToolError(code: "invalid_datetime", message: "`entity_type` must be 'event' or 'reminder'")
+            throw ToolError(code: "invalid_argument", message: "`entity_type` must be 'event' or 'reminder'")
         }
         return entity
     }
 
-    private static func mapRepositoryError<T>(_ body: () async throws -> T) async throws -> T {
+    static func mapRepositoryError<T>(_ body: () async throws -> T) async throws -> T {
         do {
             return try await body()
         } catch let error as CalendarRepositoryError {
@@ -653,12 +737,18 @@ public struct ToolError: Error {
     /// EventKit's own domain/code, surfaced verbatim where we have it (SPEC §10.1).
     public let nativeDomain: String?
     public let nativeCode: Int?
+    /// For `ambiguous_target`: what the caller could have meant (SPEC §10).
+    public let candidates: [[String: String]]
 
-    public init(code: String, message: String, native: [String: Any]? = nil) {
+    public init(
+        code: String, message: String, native: [String: Any]? = nil,
+        candidates: [[String: String]] = []
+    ) {
         self.code = code
         self.message = message
         self.nativeDomain = native?["domain"] as? String
         self.nativeCode = native?["code"] as? Int
+        self.candidates = candidates
     }
 
     public var payload: [String: Any] {
@@ -666,6 +756,7 @@ public struct ToolError: Error {
         if let nativeDomain, let nativeCode {
             out["native_error"] = ["domain": nativeDomain, "code": nativeCode]
         }
+        if !candidates.isEmpty { out["candidates"] = candidates }
         return out
     }
 

@@ -215,9 +215,19 @@ public actor EventKitRepository: CalendarRepository {
         let event = EKEvent(eventStore: store)
         event.calendar = calendar
         event.title = draft.title
+        event.timeZone = try draft.timeZoneIdentifier.map(Self.timeZone(named:)) ?? .current
+        event.isAllDay = draft.isAllDay
         event.startDate = draft.start
         event.endDate = draft.end
         event.notes = draft.notes
+        event.location = draft.location
+        event.url = draft.url.flatMap(URL.init(string:))
+        if let name = draft.availability {
+            event.availability = try Self.availability(named: name, in: calendar)
+        }
+        event.recurrenceRules = draft.recurrenceRules.isEmpty
+            ? nil : draft.recurrenceRules.map { $0.toEKRecurrenceRule() }
+        event.alarms = draft.alarms.isEmpty ? nil : draft.alarms.map(Self.ekAlarm)
         do {
             try store.save(event, span: .thisEvent, commit: true)
         } catch {
@@ -241,10 +251,10 @@ public actor EventKitRepository: CalendarRepository {
     }
 
     public func updateEvent(
-        identifier: String, patch: EventPatch, scope: RecurrenceScope?
+        identifier: String, occurrenceDate: Date?, patch: EventPatch, scope: RecurrenceScope?
     ) async throws -> EventSummary {
         try requireFullAccess(.event)
-        guard let event = store.event(withIdentifier: identifier) else {
+        guard let event = ekEvent(identifier, occurrenceDate: occurrenceDate) else {
             throw CalendarRepositoryError.notFound("event \(identifier)")
         }
         guard event.calendar?.allowsContentModifications == true, event.calendar?.isImmutable != true else {
@@ -258,13 +268,27 @@ public actor EventKitRepository: CalendarRepository {
         applyString(patch.location, to: { event.location = $0 })
         applyString(patch.notes, to: { event.notes = $0 })
         applyURL(patch.url, to: { event.url = $0 })
-        if case .set(let identifier) = patch.timeZoneIdentifier {
-            event.timeZone = TimeZone(identifier: identifier)
+        if case .set(let name) = patch.timeZoneIdentifier {
+            event.timeZone = try Self.timeZone(named: name)
         } else if case .clear = patch.timeZoneIdentifier {
             event.timeZone = nil
         }
-        if case .set(let name) = patch.availability {
-            event.availability = Self.availability(named: name) ?? event.availability
+        if case .set(let calendarID) = patch.calendarIdentifier {
+            event.calendar = try writableCalendar(calendarID, entityType: .event)
+        }
+        if case .set(let name) = patch.availability, let calendar = event.calendar {
+            event.availability = try Self.availability(named: name, in: calendar)
+        }
+        switch patch.recurrenceRules {
+        case .unchanged: break
+        case .clear: event.recurrenceRules = nil
+        case .set(let rules):
+            event.recurrenceRules = rules.isEmpty ? nil : rules.map { $0.toEKRecurrenceRule() }
+        }
+        switch patch.alarms {
+        case .unchanged: break
+        case .clear: event.alarms = nil
+        case .set(let alarms): event.alarms = alarms.isEmpty ? nil : alarms.map(Self.ekAlarm)
         }
 
         do {
@@ -272,8 +296,10 @@ public actor EventKitRepository: CalendarRepository {
         } catch {
             throw CalendarRepositoryError.native("updating event \(identifier)", underlying: error as NSError)
         }
-        guard let saved = store.event(withIdentifier: identifier).flatMap(Self.summarize(event:)) else {
-            throw CalendarRepositoryError.unsupported("event saved but no longer resolves by identifier")
+        // Summarise the saved object itself. Re-fetching by identifier would return the
+        // series' first occurrence, not the one just edited.
+        guard let saved = Self.summarize(event: event) else {
+            throw CalendarRepositoryError.unsupported("event saved but lost its identifier or dates")
         }
         return saved
     }
@@ -292,7 +318,9 @@ public actor EventKitRepository: CalendarRepository {
 
         // `predicateForEvents` silently truncates a window longer than four years, so walk
         // it in ≤4-year chunks (SPEC §9.4/§10). An event straddling a chunk seam appears in
-        // both, so dedupe by identifier.
+        // both, so dedupe — by identifier *and* occurrence: every occurrence of a recurring
+        // series shares one `eventIdentifier`, and deduping on that alone collapsed a
+        // week of daily standups into the first one.
         let fourYears: TimeInterval = 4 * 365 * 24 * 3600
         var collected: [EventSummary] = []
         var seen = Set<String>()
@@ -303,7 +331,7 @@ public actor EventKitRepository: CalendarRepository {
                 withStart: windowStart, end: windowEnd, calendars: calendars
             )
             for dto in store.events(matching: predicate).compactMap(Self.summarize(event:))
-            where seen.insert(dto.id).inserted {
+            where seen.insert(Self.occurrenceKey(dto)).inserted {
                 collected.append(dto)
             }
             windowStart = windowEnd
@@ -311,20 +339,49 @@ public actor EventKitRepository: CalendarRepository {
         return collected.sorted { ($0.start, $0.id) < ($1.start, $1.id) }
     }
 
-    public func event(withIdentifier identifier: String) async throws -> EventSummary? {
-        try requireFullAccess(.event)
-        return store.event(withIdentifier: identifier).flatMap(Self.summarize(event:))
+    /// One row per occurrence: identifier plus the occurrence's original slot.
+    static func occurrenceKey(_ event: EventSummary) -> String {
+        "\(event.id)@\(RCCTime.instant(event.occurrenceDate ?? event.start))"
     }
 
-    public func deleteEvent(identifier: String) async throws {
+    public func event(withIdentifier identifier: String, occurrenceDate: Date?) async throws -> EventSummary? {
         try requireFullAccess(.event)
-        guard let event = store.event(withIdentifier: identifier) else {
+        return ekEvent(identifier, occurrenceDate: occurrenceDate).flatMap(Self.summarize(event:))
+    }
+
+    public func deleteEvent(
+        identifier: String, occurrenceDate: Date?, scope: RecurrenceScope?
+    ) async throws {
+        try requireFullAccess(.event)
+        guard let event = ekEvent(identifier, occurrenceDate: occurrenceDate) else {
             throw CalendarRepositoryError.notFound("event \(identifier)")
         }
         do {
-            try store.remove(event, span: .thisEvent, commit: true)
+            try store.remove(event, span: scope?.ekSpan ?? .thisEvent, commit: true)
         } catch {
             throw CalendarRepositoryError.native("deleting event \(identifier)", underlying: error as NSError)
+        }
+    }
+
+    /// Resolve one event, or one occurrence of a recurring series.
+    ///
+    /// `event(withIdentifier:)` returns the series' first occurrence. A specific one is
+    /// found by fetching the window around its original date and matching both the
+    /// identifier and `occurrenceDate` (which, for a detached occurrence, stays the
+    /// original slot even after the occurrence itself has moved). The window is a few days
+    /// wide so a detached occurrence moved by up to that much is still found.
+    private func ekEvent(_ identifier: String, occurrenceDate: Date?) -> EKEvent? {
+        guard let base = store.event(withIdentifier: identifier) else { return nil }
+        guard let occurrenceDate, base.hasRecurrenceRules || base.isDetached else { return base }
+        let slack: TimeInterval = 3 * 24 * 3600
+        let predicate = store.predicateForEvents(
+            withStart: occurrenceDate.addingTimeInterval(-slack),
+            end: occurrenceDate.addingTimeInterval(slack),
+            calendars: base.calendar.map { [$0] }
+        )
+        return store.events(matching: predicate).first {
+            $0.eventIdentifier == identifier
+                && abs(($0.occurrenceDate ?? $0.startDate).timeIntervalSince(occurrenceDate)) < 1
         }
     }
 
@@ -337,6 +394,17 @@ public actor EventKitRepository: CalendarRepository {
         reminder.calendar = calendar
         reminder.title = draft.title
         reminder.notes = draft.notes
+        reminder.url = draft.url.flatMap(URL.init(string:))
+        reminder.location = draft.location
+        reminder.priority = max(0, min(9, draft.priorityRaw))
+        let zone = try draft.timeZoneIdentifier.map(Self.timeZone(named:)) ?? .current
+        reminder.timeZone = zone
+        reminder.dueDateComponents = draft.dueDate?.dateComponents(zone: zone)
+        reminder.startDateComponents = draft.startDate?.dateComponents(zone: zone)
+        reminder.recurrenceRules = draft.recurrenceRules.isEmpty
+            ? nil : draft.recurrenceRules.map { $0.toEKRecurrenceRule() }
+        let alarms = draft.alarms ?? ReminderAlertDefaults.forNewReminder(due: draft.dueDate)
+        reminder.alarms = alarms.isEmpty ? nil : alarms.map(Self.ekAlarm)
         do {
             try store.save(reminder, commit: true)
         } catch {
@@ -379,8 +447,31 @@ public actor EventKitRepository: CalendarRepository {
         if case .set(let value) = patch.priorityRaw {
             reminder.priority = max(0, min(9, value))
         }
-        applyDateComponents(patch.dueDate, zone: reminder.timeZone, to: { reminder.dueDateComponents = $0 })
-        applyDateComponents(patch.startDate, zone: reminder.timeZone, to: { reminder.startDateComponents = $0 })
+        let zone = reminder.timeZone ?? .current
+        // Setting `dueDateComponents` on a saved reminder makes EventKit fill in
+        // `startDateComponents` too (a day-only due gains a floating 00:00 start) — observed
+        // live on macOS 27. Put back whatever start the caller did not ask to change.
+        let priorStart = reminder.startDateComponents
+        applyDateComponents(patch.dueDate, zone: zone, to: { reminder.dueDateComponents = $0 })
+        if case .unchanged = patch.startDate {
+            reminder.startDateComponents = priorStart
+        } else {
+            applyDateComponents(patch.startDate, zone: zone, to: { reminder.startDateComponents = $0 })
+        }
+        if case .set(let calendarID) = patch.calendarIdentifier {
+            reminder.calendar = try writableCalendar(calendarID, entityType: .reminder)
+        }
+        switch patch.recurrenceRules {
+        case .unchanged: break
+        case .clear: reminder.recurrenceRules = nil
+        case .set(let rules):
+            reminder.recurrenceRules = rules.isEmpty ? nil : rules.map { $0.toEKRecurrenceRule() }
+        }
+        switch patch.alarms {
+        case .unchanged: break
+        case .clear: reminder.alarms = nil
+        case .set(let alarms): reminder.alarms = alarms.isEmpty ? nil : alarms.map(Self.ekAlarm)
+        }
 
         do {
             try store.save(reminder, commit: true)
@@ -424,8 +515,11 @@ public actor EventKitRepository: CalendarRepository {
                 calendars: calendars
             )
         case .incomplete:
+            // Unranged on purpose: EventKit's due-range predicate drops undated reminders,
+            // which the contract keeps unless `includeUndated` is false. The range is
+            // applied below for every completion state alike.
             predicate = store.predicateForIncompleteReminders(
-                withDueDateStarting: filter.dueFrom, ending: filter.dueTo, calendars: calendars
+                withDueDateStarting: nil, ending: nil, calendars: calendars
             )
         case .any:
             predicate = store.predicateForReminders(in: calendars)
@@ -451,9 +545,9 @@ public actor EventKitRepository: CalendarRepository {
         if let minimum = filter.minimumPriorityBucket {
             dtos = dtos.filter { ReminderPriorityBucket(raw: $0.priorityRaw).rank >= minimum.rank }
         }
-        // The `.any` / completed predicates ignore the due range; enforce it here, keeping
-        // undated reminders unless the caller excluded them.
-        if filter.completion != .incomplete, filter.dueFrom != nil || filter.dueTo != nil {
+        // No predicate applies the due range (see above); enforce it here, keeping undated
+        // reminders unless the caller excluded them.
+        if filter.dueFrom != nil || filter.dueTo != nil {
             dtos = dtos.filter { reminder in
                 guard let due = Self.date(from: reminder.dueDate) else { return filter.includeUndated }
                 if let lower = filter.dueFrom, due < lower { return false }
@@ -486,19 +580,7 @@ public actor EventKitRepository: CalendarRepository {
     /// component's own time zone, else the current calendar; a date-only value resolves to
     /// local midnight.
     static func date(from components: DateComponentsDTO?) -> Date? {
-        guard let components else { return nil }
-        var dateComponents = DateComponents()
-        dateComponents.year = components.year
-        dateComponents.month = components.month
-        dateComponents.day = components.day
-        dateComponents.hour = components.hour
-        dateComponents.minute = components.minute
-        dateComponents.second = components.second
-        var calendar = Calendar.current
-        if let identifier = components.timeZoneIdentifier, let zone = TimeZone(identifier: identifier) {
-            calendar.timeZone = zone
-        }
-        return calendar.date(from: dateComponents)
+        components?.resolvedDate()
     }
 
     /// Stable list order (SPEC §10): incomplete before completed, then by due date with
@@ -619,30 +701,49 @@ public actor EventKitRepository: CalendarRepository {
     }
 
     private func applyDateComponents(
-        _ patch: FieldPatch<Date>, zone: TimeZone?, to setter: (DateComponents?) -> Void
+        _ patch: FieldPatch<ReminderDate>, zone: TimeZone, to setter: (DateComponents?) -> Void
     ) {
         switch patch {
         case .unchanged: break
         case .clear: setter(nil)
-        case .set(let date):
-            var calendar = Calendar.current
-            if let zone { calendar.timeZone = zone }
-            var components = calendar.dateComponents(
-                [.year, .month, .day, .hour, .minute, .second], from: date
-            )
-            components.timeZone = zone
-            setter(components)
+        case .set(let value): setter(value.dateComponents(zone: zone))
         }
     }
 
-    static func availability(named name: String) -> EKEventAvailability? {
+    /// An availability the calendar's source actually supports. An unsupported one is
+    /// refused rather than silently ignored — many CalDAV servers support only busy/free.
+    static func availability(named name: String, in calendar: EKCalendar) throws -> EKEventAvailability {
+        let value: EKEventAvailability
+        let mask: EKCalendarEventAvailabilityMask
         switch name.lowercased() {
-        case "busy": return .busy
-        case "free": return .free
-        case "tentative": return .tentative
-        case "unavailable": return .unavailable
-        case "notsupported": return .notSupported
-        default: return nil
+        case "busy": (value, mask) = (.busy, .busy)
+        case "free": (value, mask) = (.free, .free)
+        case "tentative": (value, mask) = (.tentative, .tentative)
+        case "unavailable": (value, mask) = (.unavailable, .unavailable)
+        default:
+            throw CalendarRepositoryError.invalidArgument(
+                "availability must be busy, free, tentative, or unavailable (got '\(name)')"
+            )
+        }
+        guard calendar.supportedEventAvailabilities.contains(mask) else {
+            throw CalendarRepositoryError.unsupported(
+                "calendar '\(calendar.title)' does not support availability '\(name)'"
+            )
+        }
+        return value
+    }
+
+    static func timeZone(named name: String) throws -> TimeZone {
+        guard let zone = TimeZone(identifier: name) else {
+            throw CalendarRepositoryError.invalidArgument("unknown time zone '\(name)' (use an IANA name)")
+        }
+        return zone
+    }
+
+    static func ekAlarm(_ spec: AlarmSpec) -> EKAlarm {
+        switch spec {
+        case .relative(let offset): return EKAlarm(relativeOffset: offset)
+        case .absolute(let date): return EKAlarm(absoluteDate: date)
         }
     }
 

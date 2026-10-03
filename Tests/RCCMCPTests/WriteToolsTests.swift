@@ -23,8 +23,10 @@ struct WriteToolsTests {
         return (MutationExecutor(repository: repo, store: store), repo, store)
     }
 
-    private func run(_ name: String, _ args: [String: Any], _ ex: MutationExecutor) async throws -> [String: Any] {
-        try await WriteTools.run(name, arguments: args, executor: ex)
+    private func run(
+        _ name: String, _ args: [String: Any], _ ex: MutationExecutor, _ repo: InMemoryCalendarRepository
+    ) async throws -> [String: Any] {
+        try await WriteTools.run(name, arguments: args, executor: ex, repository: repo).payload
     }
 
     @Test("create_event returns the outcome envelope and a resolvable locator")
@@ -33,7 +35,7 @@ struct WriteToolsTests {
         let envelope = try await run(WriteTools.createEvent, [
             "calendar_id": "cal", "title": "Standup",
             "start": "2026-09-10T09:00:00.000Z", "end": "2026-09-10T09:30:00.000Z",
-        ], ex)
+        ], ex, repo)
         let data = try #require(envelope["data"] as? [String: Any])
         let id = try #require(data["result_identifier"] as? String)
         #expect(await repo.itemExists(identifier: id, entityType: .event))
@@ -49,7 +51,7 @@ struct WriteToolsTests {
         let created = try #require(try await run(WriteTools.createEvent, [
             "calendar_id": "cal", "title": "Old", "notes": "keep me",
             "start": "2026-09-10T09:00:00.000Z", "end": "2026-09-10T09:30:00.000Z",
-        ], ex)["data"] as? [String: Any])
+        ], ex, repo)["data"] as? [String: Any])
         let id = created["result_identifier"] as! String
 
         // set title, clear location (already nil, no-op but legal), leave notes untouched.
@@ -57,7 +59,7 @@ struct WriteToolsTests {
             "locator": created["locator"] as! String,
             "if_match": created["version"] as! String,
             "patch": ["title": "New", "location": NSNull()],
-        ], ex)
+        ], ex, repo)
         let after = try await repo.event(withIdentifier: id)
         #expect(after?.title == "New")
         #expect(after?.notes == "keep me")   // omitted → unchanged
@@ -66,28 +68,28 @@ struct WriteToolsTests {
         _ = try await run(WriteTools.updateEvent, [
             "identifier": id,
             "patch": ["notes": NSNull()],
-        ], ex)
+        ], ex, repo)
         #expect(try await repo.event(withIdentifier: id)?.notes == nil)
     }
 
     @Test("A stale if_match through the tool is a conflict ToolError")
     func conflict() async throws {
-        let (ex, _, _) = try await setup()
+        let (ex, repo, _) = try await setup()
         let created = try #require(try await run(WriteTools.createEvent, [
             "calendar_id": "cal", "title": "T",
             "start": "2026-09-10T09:00:00.000Z", "end": "2026-09-10T09:30:00.000Z",
-        ], ex)["data"] as? [String: Any])
+        ], ex, repo)["data"] as? [String: Any])
         let staleVersion = created["version"] as! String
         let locator = created["locator"] as! String
 
         _ = try await run(WriteTools.updateEvent, [
             "locator": locator, "if_match": staleVersion, "patch": ["title": "T2"],
-        ], ex)
+        ], ex, repo)
 
         do {
             _ = try await run(WriteTools.updateEvent, [
                 "locator": locator, "if_match": staleVersion, "patch": ["title": "T3"],
-            ], ex)
+            ], ex, repo)
             Issue.record("expected a conflict")
         } catch let error as ToolError {
             #expect(error.code == "conflict")
@@ -100,17 +102,17 @@ struct WriteToolsTests {
         let created = try #require(try await run(WriteTools.createEvent, [
             "calendar_id": "cal", "title": "T",
             "start": "2026-09-10T09:00:00.000Z", "end": "2026-09-10T09:30:00.000Z",
-        ], ex)["data"] as? [String: Any])
+        ], ex, repo)["data"] as? [String: Any])
         let id = created["result_identifier"] as! String
 
         await #expect(throws: ToolError.self) {
-            _ = try await run(WriteTools.createEvent, ["title": "no calendar"], ex)
+            _ = try await run(WriteTools.createEvent, ["title": "no calendar"], ex, repo)
         }
         await #expect(throws: ToolError.self) {
-            _ = try await run(WriteTools.updateEvent, ["identifier": id, "patch": [:] as [String: Any]], ex)
+            _ = try await run(WriteTools.updateEvent, ["identifier": id, "patch": [:] as [String: Any]], ex, repo)
         }
 
-        _ = try await run(WriteTools.deleteEvent, ["locator": created["locator"] as! String], ex)
+        _ = try await run(WriteTools.deleteEvent, ["locator": created["locator"] as! String], ex, repo)
         #expect(await repo.itemExists(identifier: id, entityType: .event) == false)
     }
 
@@ -119,18 +121,18 @@ struct WriteToolsTests {
         let (ex, repo, _) = try await setup()
         let created = try #require(try await run(WriteTools.createReminder, [
             "calendar_id": "cal", "title": "Water plants",
-        ], ex)["data"] as? [String: Any])
+        ], ex, repo)["data"] as? [String: Any])
         let id = created["result_identifier"] as! String
 
         _ = try await run(WriteTools.updateReminder, [
             "locator": created["locator"] as! String,
             "patch": ["priority": 2, "due": "2026-09-11T17:00:00.000Z"],
-        ], ex)
+        ], ex, repo)
         let patched = try await repo.reminder(withIdentifier: id)
         #expect(patched?.priorityRaw == 2)
         #expect(patched?.dueDate != nil)
 
-        _ = try await run(WriteTools.completeReminder, ["identifier": id], ex)
+        _ = try await run(WriteTools.completeReminder, ["identifier": id], ex, repo)
         #expect(try await repo.reminder(withIdentifier: id)?.isCompleted == true)
     }
 
@@ -142,8 +144,8 @@ struct WriteToolsTests {
             "start": "2026-09-10T09:00:00.000Z", "end": "2026-09-10T09:30:00.000Z",
             "idempotency_key": "k1",
         ]
-        let first = try #require(try await run(WriteTools.createEvent, args, ex)["data"] as? [String: Any])
-        let second = try #require(try await run(WriteTools.createEvent, args, ex)["data"] as? [String: Any])
+        let first = try #require(try await run(WriteTools.createEvent, args, ex, repo)["data"] as? [String: Any])
+        let second = try #require(try await run(WriteTools.createEvent, args, ex, repo)["data"] as? [String: Any])
         #expect(second["replayed"] as? Bool == true)
         #expect(second["operation_id"] as? String == first["operation_id"] as? String)
 
@@ -161,22 +163,22 @@ struct WriteToolsTests {
 
         let created = try #require(try await run(WriteTools.createReminderList, [
             "title": "Groceries", "source_id": "src-icloud",
-        ], ex)["data"] as? [String: Any])
+        ], ex, repo)["data"] as? [String: Any])
         let listID = created["result_identifier"] as! String
         #expect(await repo.calendarExists(identifier: listID))
 
-        _ = try await run(WriteTools.updateReminderList, ["identifier": listID, "title": "Shopping"], ex)
+        _ = try await run(WriteTools.updateReminderList, ["identifier": listID, "title": "Shopping"], ex, repo)
         let renamed = try await repo.calendar(withIdentifier: listID, entityType: .reminder)
         #expect(renamed?.title == "Shopping")
 
-        _ = try await run(WriteTools.createReminder, ["calendar_id": listID, "title": "milk"], ex)
-        let deleted = try #require(try await run(WriteTools.deleteReminderList, ["identifier": listID], ex)["data"] as? [String: Any])
+        _ = try await run(WriteTools.createReminder, ["calendar_id": listID, "title": "milk"], ex, repo)
+        let deleted = try #require(try await run(WriteTools.deleteReminderList, ["identifier": listID], ex, repo)["data"] as? [String: Any])
         #expect(deleted["reminders_removed"] as? Int == 1)
         #expect(await repo.calendarExists(identifier: listID) == false)
 
         // "cal" from setup() allows both entity types — refused.
         do {
-            _ = try await run(WriteTools.deleteReminderList, ["identifier": "cal"], ex)
+            _ = try await run(WriteTools.deleteReminderList, ["identifier": "cal"], ex, repo)
             Issue.record("expected unsupported")
         } catch let error as ToolError {
             #expect(error.code == "unsupported")

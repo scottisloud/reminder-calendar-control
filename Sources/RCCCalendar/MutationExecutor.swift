@@ -84,6 +84,12 @@ public struct MutationExecutor: Sendable {
         /// Reminders removed alongside a deleted list (SPEC §9.3).
         public var affectedCount: Int?
         public var replayed: Bool
+        /// The item as saved — the canonical re-fetch SPEC §10.1 promises after a write.
+        /// `nil` for deletes and replays.
+        public var event: EventSummary?
+        public var reminder: ReminderSummary?
+        /// A created or renamed reminder list.
+        public var calendar: CalendarSummary?
     }
 
     public enum ExecutorError: Error, Equatable {
@@ -99,6 +105,11 @@ public struct MutationExecutor: Sendable {
         case recurrenceScopeRequired
         case illegalClear([String])
         case emptyPatch
+        /// A request that is well-formed but asks for something incoherent.
+        case invalid(String)
+        /// Something EventKit cannot do for this target (e.g. moving one occurrence of a
+        /// series to another calendar).
+        case unsupported(String)
         case readOnly(String)
         case repository(code: String, message: String)
 
@@ -109,8 +120,9 @@ public struct MutationExecutor: Sendable {
             case .conflict, .staleTargetNeedsIfMatch: return "conflict"
             case .locatorUnknown, .targetUnspecified: return "not_found"
             case .locatorExpired: return "approval_stale"
-            case .bareIdentifierRejectedForRecurring, .recurrenceScopeRequired: return "unsupported"
-            case .illegalClear, .emptyPatch: return "invalid_datetime"
+            case .bareIdentifierRejectedForRecurring, .recurrenceScopeRequired, .unsupported:
+                return "unsupported"
+            case .illegalClear, .emptyPatch, .invalid: return "invalid_argument"
             case .readOnly: return "read_only"
             case .repository(let code, _): return code
             }
@@ -146,7 +158,8 @@ public struct MutationExecutor: Sendable {
             return Outcome(
                 operationID: op.id, resultIdentifier: result.resultIdentifier,
                 locator: result.locator, version: result.version,
-                affectedCount: result.affectedCount, replayed: false
+                affectedCount: result.affectedCount, replayed: false,
+                event: result.event, reminder: result.reminder, calendar: result.calendar
             )
         } catch let error as ExecutorError {
             try? store.markFailed(op.id, errorCode: error.code, detail: "\(error)")
@@ -166,6 +179,9 @@ public struct MutationExecutor: Sendable {
         var locator: String?
         var version: String?
         var affectedCount: Int?
+        var event: EventSummary?
+        var reminder: ReminderSummary?
+        var calendar: CalendarSummary?
     }
 
     private func perform(
@@ -180,39 +196,65 @@ public struct MutationExecutor: Sendable {
                 calendarID: dto?.calendarIdentifier ?? draft.calendarIdentifier,
                 sourceID: dto?.sourceIdentifier, itemIdentifier: id
             )
-            return PerformResult(resultIdentifier: id, locator: locator.handle, version: dto?.version)
+            return PerformResult(resultIdentifier: id, locator: locator.handle, version: dto?.version, event: dto)
 
         case .updateEvent(let patch):
             guard patch.illegalClears.isEmpty else { throw ExecutorError.illegalClear(patch.illegalClears) }
             guard !patch.isEmpty else { throw ExecutorError.emptyPatch }
-            let id = try await resolveTarget(request, entity: .event)
-            let before = try await requireEvent(id)
+            let target = try await resolveTarget(request, entity: .event)
+            let before = try await requireEvent(target)
             try check(ifMatch: request.ifMatch, against: before.version)
-            if before.isRecurring, request.recurrenceScope == nil {
-                throw ExecutorError.recurrenceScopeRequired
+            if before.isRecurring {
+                guard let scope = request.recurrenceScope else { throw ExecutorError.recurrenceScopeRequired }
+                if scope == .thisOccurrence, patch.calendarIdentifier.isChange {
+                    throw ExecutorError.unsupported(
+                        "one occurrence cannot move to another calendar on its own; use 'this_and_future'"
+                    )
+                }
+                if scope == .thisOccurrence, patch.recurrenceRules.isChange {
+                    throw ExecutorError.unsupported(
+                        "a repeat rule belongs to the series, not one occurrence; use 'this_and_future'"
+                    )
+                }
             }
+            let start = { if case .set(let value) = patch.start { return value } else { return before.start } }()
+            let end = { if case .set(let value) = patch.end { return value } else { return before.end } }()
+            guard end >= start else { throw ExecutorError.invalid("`end` must not precede `start`") }
             let saved = try await repository.updateEvent(
-                identifier: id, patch: patch, scope: request.recurrenceScope
+                identifier: target.identifier, occurrenceDate: target.occurrenceDate,
+                patch: patch, scope: request.recurrenceScope
             )
             let locator = try store.issueLocator(
                 entityType: "event", calendarID: saved.calendarIdentifier,
-                sourceID: saved.sourceIdentifier, itemIdentifier: saved.id
+                sourceID: saved.sourceIdentifier, itemIdentifier: saved.id,
+                // A detached occurrence shares the series' identifier too, so it needs its
+                // slot recorded just like a live one.
+                occurrenceDate: saved.isRecurring || saved.isDetached
+                    ? saved.occurrenceDate.map(RCCTime.instant) : nil
             )
-            return PerformResult(resultIdentifier: saved.id, locator: locator.handle, version: saved.version)
+            return PerformResult(
+                resultIdentifier: saved.id, locator: locator.handle, version: saved.version, event: saved
+            )
 
         case .deleteEvent:
-            let id = try await resolveTarget(request, entity: .event)
-            let before = try await requireEvent(id)
+            let target = try await resolveTarget(request, entity: .event)
+            let before = try await requireEvent(target)
             try check(ifMatch: request.ifMatch, against: before.version)
             if before.isRecurring, request.recurrenceScope == nil {
                 throw ExecutorError.recurrenceScopeRequired
             }
             // Record the target BEFORE removing it, so a crash here reconciles to succeeded.
-            try store.recordResultIdentifier(id, for: op.id)
-            try await repository.deleteEvent(identifier: id)
-            return PerformResult(resultIdentifier: id)
+            try store.recordResultIdentifier(target.identifier, for: op.id)
+            try await repository.deleteEvent(
+                identifier: target.identifier, occurrenceDate: target.occurrenceDate,
+                scope: request.recurrenceScope
+            )
+            return PerformResult(resultIdentifier: target.identifier)
 
         case .createReminder(let draft):
+            if !draft.recurrenceRules.isEmpty, draft.dueDate == nil {
+                throw ExecutorError.invalid("a repeating reminder needs a `due` date to repeat from")
+            }
             let id = try await repository.createReminder(draft)
             let dto = try await repository.reminder(withIdentifier: id)
             let locator = try store.issueLocator(
@@ -220,23 +262,49 @@ public struct MutationExecutor: Sendable {
                 calendarID: dto?.calendarIdentifier ?? draft.calendarIdentifier,
                 sourceID: dto?.sourceIdentifier, itemIdentifier: id
             )
-            return PerformResult(resultIdentifier: id, locator: locator.handle, version: dto?.version)
+            return PerformResult(
+                resultIdentifier: id, locator: locator.handle, version: dto?.version, reminder: dto
+            )
 
-        case .updateReminder(let patch):
+        case .updateReminder(var patch):
             guard patch.illegalClears.isEmpty else { throw ExecutorError.illegalClear(patch.illegalClears) }
             guard !patch.isEmpty else { throw ExecutorError.emptyPatch }
-            let id = try await resolveTarget(request, entity: .reminder)
+            let id = try await resolveTarget(request, entity: .reminder).identifier
             let before = try await requireReminder(id)
             try check(ifMatch: request.ifMatch, against: before.version)
+            let willRepeat = !(patch.recurrenceRules.resolved(from: before.recurrenceRules) ?? []).isEmpty
+            let willHaveDue: Bool = {
+                switch patch.dueDate {
+                case .unchanged: return before.dueDate != nil
+                case .set: return true
+                case .clear: return false
+                }
+            }()
+            if willRepeat, !willHaveDue {
+                throw ExecutorError.invalid("a repeating reminder needs a `due` date to repeat from")
+            }
+            // An alert that was tracking the due time follows it (Reminders.app behaviour),
+            // unless the caller said what the alerts should be.
+            if patch.dueDate.isChange, !patch.alarms.isChange {
+                let newDue: ReminderDate? = { if case .set(let value) = patch.dueDate { return value } else { return nil } }()
+                if let alarms = ReminderAlertDefaults.afterDueChange(
+                    oldDue: before.dueDate.flatMap { $0.granularity == "date" ? nil : $0.resolvedDate() },
+                    newDue: newDue, current: before.alarms
+                ) {
+                    patch.alarms = .set(alarms)
+                }
+            }
             let saved = try await repository.updateReminder(identifier: id, patch: patch)
             let locator = try store.issueLocator(
                 entityType: "reminder", calendarID: saved.calendarIdentifier,
                 sourceID: saved.sourceIdentifier, itemIdentifier: saved.id
             )
-            return PerformResult(resultIdentifier: saved.id, locator: locator.handle, version: saved.version)
+            return PerformResult(
+                resultIdentifier: saved.id, locator: locator.handle, version: saved.version, reminder: saved
+            )
 
         case .completeReminder(let completed):
-            let id = try await resolveTarget(request, entity: .reminder)
+            let id = try await resolveTarget(request, entity: .reminder).identifier
             let before = try await requireReminder(id)
             try check(ifMatch: request.ifMatch, against: before.version)
             let saved = try await repository.setReminderCompleted(identifier: id, completed: completed)
@@ -244,10 +312,12 @@ public struct MutationExecutor: Sendable {
                 entityType: "reminder", calendarID: saved.calendarIdentifier,
                 sourceID: saved.sourceIdentifier, itemIdentifier: saved.id
             )
-            return PerformResult(resultIdentifier: saved.id, locator: locator.handle, version: saved.version)
+            return PerformResult(
+                resultIdentifier: saved.id, locator: locator.handle, version: saved.version, reminder: saved
+            )
 
         case .deleteReminder:
-            let id = try await resolveTarget(request, entity: .reminder)
+            let id = try await resolveTarget(request, entity: .reminder).identifier
             let before = try await requireReminder(id)
             try check(ifMatch: request.ifMatch, against: before.version)
             try store.recordResultIdentifier(id, for: op.id)
@@ -258,14 +328,14 @@ public struct MutationExecutor: Sendable {
             let calendar = try await repository.createReminderList(
                 title: title, sourceIdentifier: sourceIdentifier
             )
-            return PerformResult(resultIdentifier: calendar.id, version: nil)
+            return PerformResult(resultIdentifier: calendar.id, calendar: calendar)
 
         case .updateReminderList(let title):
             guard let id = request.targetIdentifier ?? request.targetLocator else {
                 throw ExecutorError.targetUnspecified
             }
             let calendar = try await repository.updateReminderList(identifier: id, title: title)
-            return PerformResult(resultIdentifier: calendar.id)
+            return PerformResult(resultIdentifier: calendar.id, calendar: calendar)
 
         case .deleteReminderList:
             guard let id = request.targetIdentifier ?? request.targetLocator else {
@@ -277,7 +347,14 @@ public struct MutationExecutor: Sendable {
         }
     }
 
-    private func resolveTarget(_ request: Request, entity: RCCEntityType) async throws -> String {
+    /// What a mutation acts on: the item, and for a recurring event the one occurrence the
+    /// caller read (carried by its locator).
+    private struct Target {
+        var identifier: String
+        var occurrenceDate: Date?
+    }
+
+    private func resolveTarget(_ request: Request, entity: RCCEntityType) async throws -> Target {
         if let handle = request.targetLocator {
             switch try store.resolveLocator(handle) {
             case .ok(let locator):
@@ -287,7 +364,10 @@ public struct MutationExecutor: Sendable {
                 if request.ifMatch == nil, try !store.isLocatorCurrent(locator) {
                     throw ExecutorError.staleTargetNeedsIfMatch
                 }
-                return locator.itemIdentifier
+                return Target(
+                    identifier: locator.itemIdentifier,
+                    occurrenceDate: locator.occurrenceDate.flatMap(RCCTime.parse)
+                )
             case .unknown: throw ExecutorError.locatorUnknown
             case .expired: throw ExecutorError.locatorExpired
             }
@@ -301,12 +381,14 @@ public struct MutationExecutor: Sendable {
            let event = try await repository.event(withIdentifier: identifier), event.isRecurring {
             throw ExecutorError.bareIdentifierRejectedForRecurring
         }
-        return identifier
+        return Target(identifier: identifier)
     }
 
-    private func requireEvent(_ id: String) async throws -> EventSummary {
-        guard let dto = try await repository.event(withIdentifier: id) else {
-            throw ExecutorError.notFound(id)
+    private func requireEvent(_ target: Target) async throws -> EventSummary {
+        guard let dto = try await repository.event(
+            withIdentifier: target.identifier, occurrenceDate: target.occurrenceDate
+        ) else {
+            throw ExecutorError.notFound(target.identifier)
         }
         return dto
     }
@@ -334,7 +416,8 @@ public struct MutationExecutor: Sendable {
         }
         return Outcome(
             operationID: prior.id, resultIdentifier: prior.resultIdentifier,
-            locator: nil, version: nil, affectedCount: nil, replayed: true
+            locator: nil, version: nil, affectedCount: nil, replayed: true,
+            event: nil, reminder: nil, calendar: nil
         )
     }
 

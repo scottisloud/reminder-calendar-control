@@ -8,8 +8,9 @@ Personal-use, single-machine, macOS 26+. See [SPEC.md](SPEC.md) for the full des
 
 ## Status
 
-**Milestones 1–4 of 7 done** (M4 core; the automation-only staging flow is M6). Next:
-Milestone 5 — release proof (install/uninstall, provider matrix, iOS parity, benchmarks).
+**Milestones 1–4 of 7 done, plus the daily-driver write surface** (M4 core; the
+automation-only staging flow is M6). Next: Milestone 5 — release proof (install/uninstall,
+provider matrix, iOS parity, benchmarks).
 
 **M1 — platform & packaging proof.** Claude Desktop can talk to `rcc` end to end: a
 Desktop-spawned `rcc serve` has full Calendar and Reminders access and passes its platform
@@ -38,6 +39,15 @@ locator resolution, recurrence-scope validation, idempotency replay, and omit/nu
 patch semantics. `Reconciler` runs on `serve` startup. Verified live: full create → edit →
 conflict → delete lifecycle on a real event. 216 tests. The automation staging/impact
 matrix (§8.3) is Milestone 6.
+
+**Daily-driver write surface.** Lists and calendars by name ("Personal") anywhere an id
+is accepted; reminders due on a *day* or at a *time* (timed ones alert by default, and the
+alert follows a reschedule); repeat rules, alerts, priority, location, URL, and moves between
+lists/calendars on create and update; `complete_reminders` / `update_reminders` batches (one
+Desktop confirmation for many items); `list_reminders` `due_window` ("overdue_or_today");
+list rows labelled with their list's name; per-occurrence locators for recurring events.
+Fixed along the way: `list_events` collapsed every recurring series to its first
+occurrence, and occurrence-scoped edits/deletes hit the wrong occurrence. 240 tests.
 
 Built: the embedded `Info.plist` + Hardened Runtime + `personal-information` entitlements
 signing profile, notarization, one authoritative install path, the TCC self-disclaim
@@ -103,7 +113,7 @@ anything.
 
 ```bash
 swift build            # debug
-swift test             # 128 tests, no EventKit or TCC involvement
+swift test             # 240 tests, no EventKit or TCC involvement
 ./Scripts/build-release.sh
 ./Scripts/m1-acceptance.sh
 ```

@@ -20,6 +20,7 @@ struct RCCCommand: AsyncParsableCommand {
         version: BuildInfo.versionString,
         subcommands: [
             Setup.self,
+            Install.self,
             Doctor.self,
             Status.self,
             Serve.self,

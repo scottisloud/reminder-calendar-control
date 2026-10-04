@@ -53,4 +53,10 @@ struct ContentVersionTests {
         #expect(IfMatch.check(provided: "v1", current: "v1") == .matches)
         #expect(IfMatch.check(provided: "v0", current: "v1") == .stale(current: "v1"))
     }
+
+    @Test("The fast hex encoder produces standard SHA-256 hex, so existing versions stay valid")
+    func knownHash() {
+        #expect(RCCID.hash("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        #expect(RCCID.locatorHandle().allSatisfy { "0123456789abcdef".contains($0) })
+    }
 }

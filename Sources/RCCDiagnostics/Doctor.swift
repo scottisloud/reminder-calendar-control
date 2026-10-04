@@ -43,7 +43,7 @@ public struct Doctor: Sendable {
         checks.append(mcpRegistrationCheck())
         checks.append(launchAgentCheck())
         checks.append(stateCheck())
-        checks.append(devFixtureCheck())
+        checks.append(await devFixtureCheck())
         checks.append(keychainCheck())
         checks.append(notificationCheck())
         return HealthReport(generatedAt: now, checks: checks)
@@ -511,12 +511,18 @@ public struct Doctor: Sendable {
                 title: "Local state database",
                 status: .fail,
                 detail: error.localizedDescription,
+                remediation: "Re-run `rcc doctor`; if it persists, another process may hold the database "
+                    + "(quit Claude Desktop and retry), or re-run `rcc setup`.",
                 facts: ["path": path]
             )
         }
     }
 
-    func devFixtureCheck() -> HealthReport.Check {
+    /// The fixtures are calendars in the user's Calendar/Reminders, so the record alone
+    /// proves nothing: the user can delete one in the app, or an account resync can
+    /// invalidate its identifier. Each recorded fixture is resolved against EventKit — a
+    /// read-only lookup — and one that no longer resolves is a warning with the fix.
+    func devFixtureCheck() async -> HealthReport.Check {
         guard FileManager.default.fileExists(atPath: RCCPaths.databaseFile.path),
               let store = try? Store() else {
             return HealthReport.Check(
@@ -527,21 +533,41 @@ public struct Doctor: Sendable {
             )
         }
         var facts: [String: String] = [:]
-        var present = 0
+        var recorded = 0
+        var missing: [String] = []
+        var unverified: [String] = []
         for entityType in RCCEntityType.allCases {
-            if let fixture = (try? store.devFixture(entityType.fixtureEntityType)) ?? nil {
-                facts["\(entityType.rawValue)_calendar"] = fixture.calendarID
-                facts["\(entityType.rawValue)_title"] = fixture.title
-                present += 1
+            guard let fixture = (try? store.devFixture(entityType.fixtureEntityType)) ?? nil else { continue }
+            recorded += 1
+            facts["\(entityType.rawValue)_calendar"] = fixture.calendarID
+            facts["\(entityType.rawValue)_title"] = fixture.title
+            guard await repository.authorizationStatus(for: entityType).grantsFullAccess else {
+                unverified.append(entityType.rawValue)
+                continue
             }
+            let resolved = (try? await repository.calendar(
+                withIdentifier: fixture.calendarID, entityType: entityType
+            )) ?? nil
+            facts["\(entityType.rawValue)_exists"] = resolved == nil ? "false" : "true"
+            if resolved == nil { missing.append("\(entityType.rawValue) (\"\(fixture.title)\")") }
         }
-        guard present == RCCEntityType.allCases.count else {
+        guard recorded == RCCEntityType.allCases.count else {
             return HealthReport.Check(
                 id: "dev_fixture",
                 title: "Dev calendar & list",
                 status: .skipped,
-                detail: present == 0 ? "not provisioned" : "partially provisioned (\(present) of 2)",
+                detail: recorded == 0 ? "not provisioned" : "partially provisioned (\(recorded) of 2)",
                 remediation: "Run `rcc setup --dev` if you want the tool-owned test fixtures.",
+                facts: facts
+            )
+        }
+        if !missing.isEmpty {
+            return HealthReport.Check(
+                id: "dev_fixture",
+                title: "Dev calendar & list",
+                status: .warn,
+                detail: "recorded but no longer in EventKit: \(missing.joined(separator: ", "))",
+                remediation: "Run `rcc setup --dev` to re-provision it (it was deleted or its account resynced).",
                 facts: facts
             )
         }
@@ -549,7 +575,9 @@ public struct Doctor: Sendable {
             id: "dev_fixture",
             title: "Dev calendar & list",
             status: .ok,
-            detail: "both provisioned",
+            detail: unverified.isEmpty
+                ? "both provisioned and present"
+                : "both recorded (\(unverified.joined(separator: ", ")) not verifiable without access)",
             facts: facts
         )
     }

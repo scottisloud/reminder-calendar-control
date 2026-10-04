@@ -74,7 +74,14 @@ public actor EventKitRepository: CalendarRepository {
 
     public func calendars(for entityType: RCCEntityType) async throws -> [CalendarSummary] {
         try requireFullAccess(entityType)
-        return store.calendars(for: entityType.ekEntityType).map(Self.summarize(calendar:))
+        let defaultID = (entityType == .event
+            ? store.defaultCalendarForNewEvents
+            : store.defaultCalendarForNewReminders())?.calendarIdentifier
+        return store.calendars(for: entityType.ekEntityType).map { calendar in
+            var summary = Self.summarize(calendar: calendar)
+            summary.isDefault = calendar.calendarIdentifier == defaultID
+            return summary
+        }
     }
 
     public func calendar(withIdentifier identifier: String, entityType: RCCEntityType) async throws -> CalendarSummary? {
@@ -247,7 +254,7 @@ public actor EventKitRepository: CalendarRepository {
         // `predicateForEvents` silently truncates any range longer than four years. The
         // full chunking contract is Milestone 3's; Milestone 1 only ever asks for hours.
         let predicate = store.predicateForEvents(withStart: from, end: to, calendars: [calendar])
-        return store.events(matching: predicate).compactMap(Self.summarize(event:))
+        return autoreleasepool { store.events(matching: predicate).compactMap(Self.summarize(event:)) }
     }
 
     public func updateEvent(
@@ -330,13 +337,60 @@ public actor EventKitRepository: CalendarRepository {
             let predicate = store.predicateForEvents(
                 withStart: windowStart, end: windowEnd, calendars: calendars
             )
-            for dto in store.events(matching: predicate).compactMap(Self.summarize(event:))
-            where seen.insert(Self.occurrenceKey(dto)).inserted {
-                collected.append(dto)
+            autoreleasepool {
+                for dto in store.events(matching: predicate).compactMap(Self.summarize(event:))
+                where seen.insert(Self.occurrenceKey(dto)).inserted {
+                    collected.append(dto)
+                }
             }
             windowStart = windowEnd
         }
         return collected.sorted { ($0.start, $0.id) < ($1.start, $1.id) }
+    }
+
+    /// The paged form of `listEvents` + `EventQuery.matches`. Filtering and ordering run on
+    /// a light conversion; only the page pays for alarms, recurrence rules, and attendees —
+    /// lazily loaded relations that cost a calaccessd round trip each. Measured on 8,673
+    /// occurrences: 16.8 s → see docs/milestone-5-findings.md. The `EKEvent`s live only for
+    /// this call (§7.4).
+    public func queryEvents(_ query: EventQuery) async throws -> QueryPage<EventSummary> {
+        try requireFullAccess(.event)
+        // Every fetched EKEvent and everything it lazily loads is autoreleased. Swift
+        // concurrency's executor threads do not drain an autorelease pool per job, so
+        // without this a large query leaked ~27 MB per call into `rcc serve` for its whole
+        // lifetime (measured at M5: 234 → 780 MB over 25 ten-year queries).
+        return autoreleasepool {
+            let calendars: [EKCalendar]?
+            if let identifiers = query.calendarIdentifiers {
+                calendars = identifiers.compactMap { store.calendar(withIdentifier: $0) }
+                if calendars?.isEmpty == true { return QueryPage(items: [], totalMatched: 0) }
+            } else {
+                calendars = nil
+            }
+            let fourYears: TimeInterval = 4 * 365 * 24 * 3600
+            var collected: [(EKEvent, EventSummary)] = []
+            var seen = Set<String>()
+            var windowStart = query.from
+            while windowStart < query.to {
+                let windowEnd = min(query.to, windowStart.addingTimeInterval(fourYears))
+                let predicate = store.predicateForEvents(withStart: windowStart, end: windowEnd, calendars: calendars)
+                for event in store.events(matching: predicate) {
+                    guard let light = Self.summarizeLight(
+                        event: event, notes: query.text != nil && query.searchNotes,
+                        participants: query.attendee != nil
+                    ) else { continue }
+                    guard seen.insert(Self.occurrenceKey(light)).inserted, query.matches(light) else { continue }
+                    collected.append((event, light))
+                }
+                windowStart = windowEnd
+            }
+            collected.sort { ($0.1.start, $0.1.id) < ($1.1.start, $1.1.id) }
+            let range = pageRange(count: collected.count, offset: query.offset, limit: query.limit)
+            return QueryPage(
+                items: collected[range].compactMap { Self.summarize(event: $0.0) },
+                totalMatched: collected.count
+            )
+        }
     }
 
     /// One row per occurrence: identifier plus the occurrence's original slot.
@@ -424,7 +478,7 @@ public actor EventKitRepository: CalendarRepository {
         // requests" mistake SPEC §7.4 forbids.
         return await withCheckedContinuation { continuation in
             store.fetchReminders(matching: predicate) { reminders in
-                continuation.resume(returning: (reminders ?? []).map(Self.summarize(reminder:)))
+                continuation.resume(returning: autoreleasepool { (reminders ?? []).map(Self.summarize(reminder:)) })
             }
         }
     }
@@ -502,61 +556,67 @@ public actor EventKitRepository: CalendarRepository {
 
     public func listReminders(_ filter: ReminderFilter) async throws -> [ReminderSummary] {
         try requireFullAccess(.reminder)
+        let predicate = try reminderPredicate(filter)
+
+        // Convert to DTOs inside the callback: `[EKReminder]` is not `Sendable` and must
+        // not cross the continuation (the same rule §7.4 applies to every fetched object).
+        let dtos: [ReminderSummary] = await withCheckedContinuation { continuation in
+            store.fetchReminders(matching: predicate) { reminders in
+                continuation.resume(returning: autoreleasepool { (reminders ?? []).map(Self.summarize(reminder:)) })
+            }
+        }
+        // Post-fetch filters, applied before any pagination the caller layers on (SPEC §10).
+        return dtos.filter(filter.matches).sorted(by: ReminderFilter.precedes)
+    }
+
+    /// The paged form. Filtering and ordering run on a light conversion (no alarms, no
+    /// recurrence rules — each of those is a round trip to calaccessd per reminder); only
+    /// the page is fully converted. The whole pipeline runs inside the fetch callback so no
+    /// `EKReminder` outlives it (§7.4).
+    public func queryReminders(
+        _ filter: ReminderFilter, offset: Int, limit: Int
+    ) async throws -> QueryPage<ReminderSummary> {
+        try requireFullAccess(.reminder)
+        let predicate = try reminderPredicate(filter)
+        return await withCheckedContinuation { continuation in
+            store.fetchReminders(matching: predicate) { reminders in
+                let page: QueryPage<ReminderSummary> = autoreleasepool {
+                let matched = (reminders ?? [])
+                    .map { ($0, Self.summarizeLight(reminder: $0)) }
+                    .filter { filter.matches($0.1) }
+                    .sorted { ReminderFilter.precedes($0.1, $1.1) }
+                let range = pageRange(count: matched.count, offset: offset, limit: limit)
+                return QueryPage(
+                    items: matched[range].map { Self.summarize(reminder: $0.0) },
+                    totalMatched: matched.count
+                )
+                }
+                continuation.resume(returning: page)
+            }
+        }
+    }
+
+    private func reminderPredicate(_ filter: ReminderFilter) throws -> NSPredicate {
         let calendars: [EKCalendar]? = filter.calendarIdentifiers?.compactMap {
             store.calendar(withIdentifier: $0)
         }
-        if let calendars, calendars.isEmpty { return [] }
-
-        let predicate: NSPredicate
+        // An explicit list that resolves to nothing must match nothing — `nil` would mean
+        // every list.
+        if let calendars, calendars.isEmpty { return NSPredicate(value: false) }
         switch filter.completion {
         case .completed:
-            predicate = store.predicateForCompletedReminders(
+            return store.predicateForCompletedReminders(
                 withCompletionDateStarting: filter.completedFrom, ending: filter.completedTo,
                 calendars: calendars
             )
         case .incomplete:
             // Unranged on purpose: EventKit's due-range predicate drops undated reminders,
             // which the contract keeps unless `includeUndated` is false. The range is
-            // applied below for every completion state alike.
-            predicate = store.predicateForIncompleteReminders(
-                withDueDateStarting: nil, ending: nil, calendars: calendars
-            )
+            // applied by `ReminderFilter.matches` for every completion state alike.
+            return store.predicateForIncompleteReminders(withDueDateStarting: nil, ending: nil, calendars: calendars)
         case .any:
-            predicate = store.predicateForReminders(in: calendars)
+            return store.predicateForReminders(in: calendars)
         }
-
-        // Convert to DTOs inside the callback: `[EKReminder]` is not `Sendable` and must
-        // not cross the continuation (the same rule §7.4 applies to every fetched object).
-        var dtos: [ReminderSummary] = await withCheckedContinuation { continuation in
-            store.fetchReminders(matching: predicate) { reminders in
-                continuation.resume(returning: (reminders ?? []).map(Self.summarize(reminder:)))
-            }
-        }
-
-        // Post-fetch filters, applied before any pagination the caller layers on (SPEC §10).
-        if let text = filter.text, !text.isEmpty {
-            dtos = dtos.filter { reminder in
-                let haystack = filter.searchNotes
-                    ? "\(reminder.title)\n\(reminder.notes ?? "")"
-                    : reminder.title
-                return haystack.localizedCaseInsensitiveContains(text)
-            }
-        }
-        if let minimum = filter.minimumPriorityBucket {
-            dtos = dtos.filter { ReminderPriorityBucket(raw: $0.priorityRaw).rank >= minimum.rank }
-        }
-        // No predicate applies the due range (see above); enforce it here, keeping undated
-        // reminders unless the caller excluded them.
-        if filter.dueFrom != nil || filter.dueTo != nil {
-            dtos = dtos.filter { reminder in
-                guard let due = Self.date(from: reminder.dueDate) else { return filter.includeUndated }
-                if let lower = filter.dueFrom, due < lower { return false }
-                if let upper = filter.dueTo, due > upper { return false }
-                return true
-            }
-        }
-
-        return dtos.sorted { Self.reminderOrder($0) < Self.reminderOrder($1) }
     }
 
     public func reminder(withIdentifier identifier: String) async throws -> ReminderSummary? {
@@ -581,24 +641,6 @@ public actor EventKitRepository: CalendarRepository {
     /// local midnight.
     static func date(from components: DateComponentsDTO?) -> Date? {
         components?.resolvedDate()
-    }
-
-    /// Stable list order (SPEC §10): incomplete before completed, then by due date with
-    /// undated last, then title, then identifier.
-    static func reminderOrder(_ reminder: ReminderSummary) -> some Comparable {
-        let due = date(from: reminder.dueDate)?.timeIntervalSince1970 ?? .greatestFiniteMagnitude
-        return SortKey(completed: reminder.isCompleted, due: due, title: reminder.title, id: reminder.id)
-    }
-
-    private struct SortKey: Comparable {
-        let completed: Bool
-        let due: Double
-        let title: String
-        let id: String
-        static func < (lhs: SortKey, rhs: SortKey) -> Bool {
-            (lhs.completed ? 1 : 0, lhs.due, lhs.title, lhs.id)
-                < (rhs.completed ? 1 : 0, rhs.due, rhs.title, rhs.id)
-        }
     }
 
     public func itemExists(identifier: String, entityType: RCCEntityType) async -> Bool {
@@ -753,11 +795,13 @@ public actor EventKitRepository: CalendarRepository {
         }
         guard calendar.allowedEntityTypes.contains(entityType.ekEntityMask) else {
             throw CalendarRepositoryError.unsupported(
-                "calendar \(identifier) does not accept \(entityType.rawValue) items"
+                "calendar '\(calendar.title)' does not accept \(entityType.rawValue) items"
             )
         }
         guard calendar.allowsContentModifications, !calendar.isImmutable else {
-            throw CalendarRepositoryError.readOnly("calendar \(identifier)")
+            // Named by title: the caller probably chose it by name, and a bare UUID in the
+            // error tells them nothing (subscribed, birthday, and shared read-only calendars).
+            throw CalendarRepositoryError.readOnly("calendar '\(calendar.title)' (\(identifier))")
         }
         return calendar
     }
@@ -865,6 +909,36 @@ public actor EventKitRepository: CalendarRepository {
         )
         dto.version = ContentVersion.make(dto.contentFields, lastModified: event.lastModifiedDate)
         return dto
+    }
+
+    /// Only the fields `EventQuery.matches`, ordering, and occurrence dedupe read — all of
+    /// them loaded with the event itself. Notes and participants only on request. No
+    /// `version`: it hashes alarms and rules, which is exactly the cost being avoided.
+    static func summarizeLight(event: EKEvent, notes: Bool, participants: Bool) -> EventSummary? {
+        guard let identifier = event.eventIdentifier, let start = event.startDate, let end = event.endDate
+        else { return nil }
+        return EventSummary(
+            id: identifier, title: event.title ?? "", start: start, end: end,
+            calendarIdentifier: event.calendar?.calendarIdentifier ?? "",
+            location: event.location,
+            notes: notes && event.hasNotes ? event.notes : nil,
+            occurrenceDate: event.occurrenceDate,
+            participants: participants ? (event.attendees ?? []).map { participant(from: $0) } : [],
+            organizer: participants ? event.organizer.map { participant(from: $0) } : nil
+        )
+    }
+
+    /// The fields `ReminderFilter.matches` and the ordering read; no alarms or rules.
+    static func summarizeLight(reminder: EKReminder) -> ReminderSummary {
+        ReminderSummary(
+            id: reminder.calendarItemIdentifier, title: reminder.title ?? "",
+            isCompleted: reminder.isCompleted,
+            calendarIdentifier: reminder.calendar?.calendarIdentifier ?? "",
+            notes: reminder.notes,
+            dueDate: reminder.dueDateComponents.map(DateComponentsDTO.init),
+            completionDate: reminder.completionDate,
+            priorityRaw: reminder.priority
+        )
     }
 
     static func summarize(reminder: EKReminder) -> ReminderSummary {

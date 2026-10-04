@@ -67,8 +67,13 @@ public struct HealthReport: Sendable {
         self.checks = checks
     }
 
+    /// The worst applicable status. A `skipped` check is not applicable by definition, so it
+    /// does not drag a healthy install down to "SKIPPED" (as an absent `--dev` fixture did);
+    /// only an all-skipped report is overall `skipped`.
     public var overall: Status {
-        checks.map(\.status).max() ?? .unknown
+        let applicable = checks.map(\.status).filter { $0 != .skipped }
+        if applicable.isEmpty { return checks.isEmpty ? .unknown : .skipped }
+        return applicable.max() ?? .unknown
     }
 
     /// Any check that outright failed. `unknown` is not a failure — it means the check

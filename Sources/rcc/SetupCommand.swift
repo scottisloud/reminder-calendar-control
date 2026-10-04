@@ -38,9 +38,6 @@ struct Setup: AsyncParsableCommand {
     @Flag(name: .long, help: "Delete the dev calendar and reminder list that `--dev` created, and nothing else.")
     var removeDev = false
 
-    @Flag(name: .long, help: "Provision Tier 1 automation credentials. Not implemented until Milestone 7.")
-    var enableTier1 = false
-
     @Flag(name: .long, help: "With --uninstall: delete rcc's local state and logs instead of preserving them. Never touches Calendar or Reminders data.")
     var purgeState = false
 
@@ -82,14 +79,6 @@ struct Setup: AsyncParsableCommand {
     private func runInstall() async throws {
         try requireDisclaimed()
         try requireInstalledPath()
-
-        if enableTier1 {
-            throw RCCError(
-                .usage,
-                "Tier 1 automation is not implemented yet (SPEC §11.2, Milestone 7).",
-                remediation: "Run `rcc setup` without --enable-tier1. Core setup never needs an API key."
-            )
-        }
 
         let repository = EventKitRepository()
 
@@ -138,10 +127,40 @@ struct Setup: AsyncParsableCommand {
         Output.line("  notifications: \(capability.detail)")
 
         Output.line("")
-        Output.line("Setup complete. Quit Claude Desktop fully (⌘Q) and relaunch — it does not")
-        Output.line("reload claude_desktop_config.json while running.")
+        Output.line("Setup complete.")
+        offerDesktopRestart()
         Output.line("")
         Output.line("Run `rcc doctor` to confirm, and `rcc selftest` to prove read/write works.")
+    }
+
+    /// Desktop reads its config only at launch. Offer to do the ⌘Q-and-relaunch for the
+    /// user rather than leave it as an instruction that is easy to miss — but only ask: it
+    /// may be hosting the very conversation that is installing rcc.
+    private func offerDesktopRestart() {
+        guard ClaudeDesktopApp.isRunning else {
+            Output.line("Claude Desktop will pick up rcc the next time it starts.")
+            return
+        }
+        guard isatty(STDIN_FILENO) == 1 else {
+            Output.line("Quit Claude Desktop fully (⌘Q) and relaunch — it reads its config only at launch.")
+            return
+        }
+        Output.line("")
+        Output.line("Claude Desktop reads its config only at launch, so it needs a restart to see rcc.")
+        Output.error("Restart Claude Desktop now? [Y/n] ")
+        let answer = readLine(strippingNewline: true)?.trimmingCharacters(in: .whitespaces).lowercased() ?? "n"
+        guard answer.isEmpty || answer == "y" || answer == "yes" else {
+            Output.line("Skipped. Quit it fully (⌘Q) and relaunch when convenient.")
+            return
+        }
+        switch ClaudeDesktopApp.restart() {
+        case .restarted:
+            Output.line("Claude Desktop restarted.")
+        case .didNotQuit:
+            Output.line("Claude Desktop did not quit (it may be asking about something). Quit it with ⌘Q and relaunch.")
+        case .couldNotRelaunch(let why):
+            Output.line("Claude Desktop quit but could not be relaunched (\(why)); open it yourself.")
+        }
     }
 
     // MARK: - Authorization
@@ -399,9 +418,9 @@ struct Setup: AsyncParsableCommand {
             throw RCCError(
                 .install,
                 "rcc setup must run from the installed binary, not \(running).",
-                remediation: "Install first, then run setup from the stable path:\n"
-                    + "    ./Scripts/install.sh\n"
-                    + "    \"\(RCCPaths.installedBinary.path)\" setup --dev\n\n"
+                remediation: "Install this copy first, then run setup from the stable path:\n"
+                    + "    \"\(running)\" install\n"
+                    + "    \"\(RCCPaths.installedBinary.path)\" setup\n\n"
                     + "Pass --allow-any-path to override (development only)."
             )
         }

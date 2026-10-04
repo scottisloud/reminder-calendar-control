@@ -35,6 +35,9 @@ struct Setup: AsyncParsableCommand {
     @Flag(name: .long, help: "Provision the dedicated dev calendar and reminder list used by tests.")
     var dev = false
 
+    @Flag(name: .long, help: "Delete the dev calendar and reminder list that `--dev` created, and nothing else.")
+    var removeDev = false
+
     @Flag(name: .long, help: "Provision Tier 1 automation credentials. Not implemented until Milestone 7.")
     var enableTier1 = false
 
@@ -58,7 +61,9 @@ struct Setup: AsyncParsableCommand {
 
     func run() async throws {
         do {
-            if uninstall {
+            if removeDev {
+                try await runRemoveDev()
+            } else if uninstall {
                 try await runUninstall()
             } else if verify {
                 try await runVerify()
@@ -247,6 +252,34 @@ struct Setup: AsyncParsableCommand {
                 cdhash: signature?.cdhash
             )
         )
+    }
+
+    // MARK: - Dev fixtures
+
+    /// The one path that deletes the `--dev` fixtures — explicit, never a side effect of
+    /// install or uninstall. `DevFixtureManager.remove` refuses any calendar that is not the
+    /// recorded fixture, so this cannot reach a calendar the user made.
+    private func runRemoveDev() async throws {
+        try requireDisclaimed()
+        let store = try Store()
+        let fixtures = DevFixtureManager(repository: EventKitRepository(), store: store)
+        for entityType in RCCEntityType.allCases {
+            guard let recorded = try fixtures.recorded(entityType) else {
+                Output.line("  dev \(entityType.rawValue) fixture: none recorded")
+                continue
+            }
+            do {
+                try await fixtures.remove(entityType)
+                Output.line("  dev \(entityType.rawValue) fixture: deleted \"\(recorded.title)\"")
+            } catch CalendarRepositoryError.notFound {
+                // Already deleted (in Calendar/Reminders, or by an account resync): the
+                // goal is reached, so forget the record and carry on with the other one.
+                try store.removeDevFixture(entityType.fixtureEntityType)
+                Output.line("  dev \(entityType.rawValue) fixture: \"\(recorded.title)\" was already gone")
+            }
+        }
+        Output.line("")
+        Output.line("`rcc selftest` and Scripts/parity.py need them; `rcc setup --dev` recreates them.")
     }
 
     // MARK: - Uninstall

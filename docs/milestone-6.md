@@ -10,8 +10,8 @@ correctly.* Met as follows:
 - **The week** is proven in a deterministic simulation (`simulatedWeek`): launchd's
   30-minute cadence for seven days, every tick invoked twice concurrently, the Mac asleep
   for 15 hours mid-week. Exactly 7 cleanup runs and 5 weekday flag runs, one per slot, none
-  stuck or failed, and nothing deleted unattended. Repeated 25× clean. The real week is now
-  running on this Mac (the flag rule is enabled); `rcc automations log` shows it.
+  stuck or failed, and nothing deleted unattended. Repeated 25× clean. A calendar-time week
+  was dropped by direction; the simulation is the evidence.
 - **Crash recovery**: every deletion an approval executes goes through `MutationExecutor`
   and the §9.6 journal, whose fault injection at every transition is M2's (unchanged).
   New here: an approval interrupted part-way resumes without repeating finished items
@@ -68,12 +68,13 @@ items `already_deleted`. Each deletion is journalled and audited under the appro
 - `create_automation` ×2 over MCP, the way Claude would; a `delete` rule on events refused.
 - Flag rule: found 1 meeting with no place in the next 7 days; notification posted.
 - Cleanup rule (Personal, > 30 days): **446 matches, over its `max_fan_out` of 200** — the
-  run stopped, changed nothing, notified, and `rcc doctor` warns. Disabled pending the
-  user's decision; nothing was staged or deleted.
+  run stopped, changed nothing, notified, and `rcc doctor` warned. Nothing was staged or
+  deleted.
+- Both rules were test fixtures for the above and were removed afterwards; no rules are
+  configured.
 - `rcc automations approve` from a non-TTY shell: refused.
 
 ## Not done
 
-- The calendar-time week itself (running now; see above). By direction, no other long
-  soak.
+- The calendar-time week, dropped by direction (as was M5's soak).
 - Tier 1 (LLM-in-the-loop) is Milestone 7.

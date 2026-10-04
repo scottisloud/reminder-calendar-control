@@ -17,7 +17,7 @@ Clean up anything created afterwards.
 | Side | Version | OS | Date | Who |
 |---|---|---|---|---|
 | rcc | 0.1.0+4519f2d (notarized) | macOS 27.0.1 (26A434) | 2026-10-03 | Claude, via `Scripts/parity.py` against the installed binary — **18/18 as expected** |
-| Claude for iOS | _fill in_ | _fill in_ | _fill in_ | Scott |
+| Claude for iOS | — | — | — | **Skipped by direction (2026-10-03).** The corpus stays here to run later if wanted. |
 
 ## Corpus
 

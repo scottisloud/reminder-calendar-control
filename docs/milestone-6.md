@@ -77,4 +77,5 @@ items `already_deleted`. Each deletion is journalled and audited under the appro
 ## Not done
 
 - The calendar-time week, dropped by direction (as was M5's soak).
-- Tier 1 (LLM-in-the-loop) is Milestone 7.
+- Tier 1 (LLM-in-the-loop) was Milestone 7; dropped by direction — Claude's own scheduled
+  tasks calling rcc's MCP tools cover it.

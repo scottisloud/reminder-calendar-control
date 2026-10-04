@@ -3,7 +3,6 @@
 
 Usage:
     Scripts/benchmark.py [--iterations N] [--json out.json]
-    Scripts/benchmark.py --soak HOURS --csv soak.csv [--interval SECONDS]
 
 Runs the *installed* binary (the TCC grant is keyed to its path) through Claude Desktop's
 own `disclaimer` helper, exactly the way Desktop spawns `rcc serve`, so the numbers are
@@ -14,10 +13,9 @@ Measures:
     samples over 60 s), RSS and physical footprint after warm-up;
   - read latency p50/p95 and response size for representative queries over the real
     data on this Mac, including the largest windows it holds;
-  - `automations run` (the LaunchAgent's no-op firing) cold start: wall, CPU, max RSS.
-
---soak keeps one `serve` alive for HOURS, issuing a realistic query every --interval
-seconds and sampling RSS/footprint/CPU time every 5 minutes into a CSV.
+  - `automations run` (the LaunchAgent's no-op firing) cold start: wall, CPU, max RSS;
+  - memory under sustained load: footprint after every 5 of 25 back-to-back ten-year
+    `list_events` queries (stands in for a long-uptime soak, which was dropped at M5).
 """
 import argparse, datetime, json, os, re, statistics, subprocess, sys, time
 
@@ -181,6 +179,18 @@ def benchmark(iterations):
     report["memory_idle_mb"] = dict(zip(("rss", "footprint"), memory(server.pid)))
     server.close()
 
+    # Sustained load: does memory come back, or ratchet? (A leak here measured +27 MB per
+    # large query before EventKit fetches were wrapped in autorelease pools.)
+    server = Server()
+    label, name, args = next(q for q in queries() if q[0].startswith("list_events 10 years"))
+    footprints = []
+    for i in range(25):
+        server.tool(name, args)
+        if i % 5 == 4:
+            footprints.append(round(memory(server.pid)[1] or 0, 1))
+    report["memory_sustained_load_mb"] = {"query": label, "footprint_after_every_5": footprints}
+    server.close()
+
     # LaunchAgent firing: `automations run`, launched directly as launchd does.
     runs = []
     for _ in range(iterations):
@@ -199,39 +209,11 @@ def benchmark(iterations):
     return report
 
 
-def soak(hours, csv_path, interval):
-    server = Server()
-    deadline = time.time() + hours * 3600
-    next_sample = 0
-    requests = 0
-    with open(csv_path, "a") as f:
-        if f.tell() == 0:
-            f.write("timestamp,elapsed_h,requests,rss_mb,footprint_mb,cpu_s\n")
-        start = time.time()
-        while time.time() < deadline:
-            for _, name, args in queries()[:2] + queries()[5:6]:
-                server.tool(name, args); requests += 1
-            if time.time() >= next_sample:
-                rss, fp = memory(server.pid)
-                f.write(f"{iso(datetime.datetime.now())},{(time.time() - start) / 3600:.3f},{requests},"
-                        f"{rss:.1f},{fp if fp is not None else ''},{cpu_seconds(server.pid):.2f}\n")
-                f.flush()
-                next_sample = time.time() + 300
-            time.sleep(interval)
-    server.close()
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iterations", type=int, default=25)
     ap.add_argument("--json")
-    ap.add_argument("--soak", type=float, help="hours")
-    ap.add_argument("--csv")
-    ap.add_argument("--interval", type=float, default=60)
     a = ap.parse_args()
-    if a.soak:
-        soak(a.soak, a.csv or "soak.csv", a.interval)
-        return
     report = benchmark(a.iterations)
     text = json.dumps(report, indent=2)
     if a.json:

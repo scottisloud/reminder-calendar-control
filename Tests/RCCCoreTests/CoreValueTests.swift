@@ -92,7 +92,8 @@ struct HealthReportTests {
     func overallIsWorst() {
         #expect(HealthReport(checks: [check("a", .ok), check("b", .warn)]).overall == .warn)
         #expect(HealthReport(checks: [check("a", .warn), check("b", .fail)]).overall == .fail)
-        #expect(HealthReport(checks: [check("a", .ok), check("b", .skipped)]).overall == .skipped)
+        #expect(HealthReport(checks: [check("a", .ok), check("b", .skipped)]).overall == .ok)
+        #expect(HealthReport(checks: [check("a", .skipped), check("b", .skipped)]).overall == .skipped)
         #expect(HealthReport(checks: [check("a", .ok), check("b", .unknown)]).overall == .unknown)
     }
 

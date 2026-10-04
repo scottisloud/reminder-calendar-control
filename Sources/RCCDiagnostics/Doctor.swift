@@ -626,7 +626,7 @@ public struct Doctor: Sendable {
                 id: "keychain",
                 title: "Keychain",
                 status: .ok,
-                detail: "reachable; Tier 1 credential \(state.credentialPresence.detail)",
+                detail: "reachable; \(state.credentialPresence.detail)",
                 facts: state.facts
             )
         case .locked:
@@ -647,8 +647,7 @@ public struct Doctor: Sendable {
                 detail: state.credentialPresence.detail,
                 remediation: "A rebuild changed this binary's signature, so the keychain ACL no longer "
                     + "matches. Remove the stale item with "
-                    + "`security delete-generic-password -s \(KeychainProbe.credentialService)` and re-run "
-                    + "`rcc setup --enable-tier1`.",
+                    + "`security delete-generic-password -s \(KeychainProbe.credentialService)`.",
                 facts: state.facts
             )
         case .error:

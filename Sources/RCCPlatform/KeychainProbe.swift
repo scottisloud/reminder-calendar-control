@@ -38,7 +38,7 @@ public enum KeychainProbe {
             case .present:
                 return "present"
             case .absent:
-                return "absent (not configured — expected until Tier 1 is enabled)"
+                return "absent (rcc stores no credentials)"
             case .locked(let status):
                 return "keychain locked or interaction required (OSStatus \(status))"
             case .accessDenied(let status):

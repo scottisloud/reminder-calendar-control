@@ -8,7 +8,7 @@ import Foundation
 public enum BuildInfo {
     /// Marketing version. Kept in one place; `Scripts/build-release.sh` asserts it
     /// matches the embedded `CFBundleShortVersionString`.
-    public static let version = "0.1.0"
+    public static let version = "0.2.0"
 
     /// Git revision, injected at build time. Absent for a plain `swift build`.
     public static var gitRevision: String? {

@@ -317,11 +317,21 @@ public enum Disclaim {
     ///
     /// Uses `write(2)` rather than `print`: buffered stdio does not survive the exec, and
     /// stdout belongs to the JSON-RPC framer.
+    ///
+    /// On an interactive terminal the healthy lines are noise on every command, so there
+    /// they go only to unified logging. `RCC_DISCLAIM_VERBOSE=1` forces them onto stderr,
+    /// `=0` keeps them off it (the Homebrew cask's install step). Errors always reach
+    /// stderr, and anything redirected — a log file, the M1 harness — otherwise still gets
+    /// every line.
     private static func emit(level: EmitLevel, _ event: String, _ fields: [String: String]) {
         let rendered = fields.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " ")
         let line = "RCC_DISCLAIM event=\(event) \(rendered)\n"
-        line.withCString { pointer in
-            _ = write(STDERR_FILENO, pointer, strlen(pointer))
+        let verbose = getenv("RCC_DISCLAIM_VERBOSE").map { String(cString: $0) }
+        let quiet = level != .error && (verbose == "0" || (verbose != "1" && isatty(STDERR_FILENO) == 1))
+        if !quiet {
+            line.withCString { pointer in
+                _ = write(STDERR_FILENO, pointer, strlen(pointer))
+            }
         }
         switch level {
         case .debug: logger.debug("RCC_DISCLAIM event=\(event, privacy: .public) \(rendered, privacy: .public)")

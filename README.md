@@ -80,8 +80,45 @@ Calendar and reminder CRUD arrives in Milestones 3 and 4; automation in 6 and 7.
 
 ## Install
 
-Needs an Apple Developer ID certificate and a `notarytool` keychain profile — macOS 26
-will not present the Calendar/Reminders prompt for an ad-hoc binary.
+```bash
+brew install --cask scottisloud/tap/rcc
+rcc setup
+```
+
+Or, without Homebrew (or by asking an agent to install it from
+`github.com/scottisloud/homebrew-tap`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/scottisloud/homebrew-tap/main/install.sh | bash
+```
+
+`rcc setup` is the one step that needs a person. macOS asks for Calendar and Reminders
+access, so approve both prompts. Setup then registers rcc with Claude Desktop and offers to
+restart it. The curl installer runs setup in your terminal, or opens a Terminal window for it
+when an agent runs the installer with no terminal attached.
+
+Either way, the downloaded binary only delivers itself: `rcc install` copies it atomically
+to `~/Library/Application Support/reminder-calendar-control/bin/rcc`, because macOS ties
+the permission grant to that path plus the signing identity. `rcc` on PATH is a link to that
+copy. `brew upgrade rcc` updates it the same way, and the grant carries over.
+`brew uninstall --zap rcc` removes everything except your Calendar and Reminders data,
+which rcc never touches.
+
+### Releasing
+
+Releases are built and notarized on this Mac and published to the public tap
+(`scottisloud/homebrew-tap`). The tap's README, installer and cask template live in
+`distribution/homebrew-tap/`. Bump `BuildInfo.version`, commit, then:
+
+```bash
+RCC_NOTARY_PROFILE=rcc-notary ./Scripts/release.sh --dry-run   # inspect ../homebrew-tap
+RCC_NOTARY_PROFILE=rcc-notary ./Scripts/release.sh
+```
+
+### Building from source
+
+Needs an Apple Developer ID certificate and a `notarytool` keychain profile, because
+macOS 26 won't show the Calendar/Reminders prompt to an ad-hoc binary.
 
 ```bash
 export RCC_NOTARY_PROFILE=<your-notarytool-profile>
@@ -90,16 +127,9 @@ export RCC_NOTARY_PROFILE=<your-notarytool-profile>
 "$HOME/Library/Application Support/reminder-calendar-control/bin/rcc" setup --dev
 ```
 
-`setup` **must be run interactively from a real terminal** (Terminal.app, Ghostty, …). It
-brings up a foreground `NSApplication` and requests Calendar and Reminders access — approve
-both macOS dialogs. A non-interactive run reports what is missing and exits non-zero. The
-grant is recorded against `rcc`'s own designated requirement, so a later Desktop-spawned
-`rcc serve` matches it.
-
-`setup` must also run from the installed path — macOS records the grant against whichever
-binary asked for it, so granting from a build directory grants a copy nothing else runs.
-
-Then quit Claude Desktop fully (⌘Q) and relaunch; it does not reload its config file.
+`setup` must run interactively from a real terminal (Terminal.app, Ghostty, …) and from
+the installed path. It brings up a foreground `NSApplication` to request access; a
+non-interactive run reports what is missing and exits non-zero.
 
 A headless app bundle (`./Scripts/install.sh --bundle` → `RCC.app`, `LSUIElement`, no
 windows) exists only so the tool can carry an app icon, which a bare Mach-O cannot. It is
@@ -111,6 +141,7 @@ replacing one file is a true atomic rename; replacing a bundle is not.
 | Command | What it does |
 |---|---|
 | `rcc setup [--dev] [--verify] [--uninstall]` | Grant access, register with Claude Desktop, install the LaunchAgent. `--verify` after an update; `--uninstall [--keep-state\|--purge-state] [--remove-binary]` removes rcc and never touches Calendar or Reminders data; `--remove-dev` deletes only the `--dev` test calendar and list |
+| `rcc install [--link <dir>] [--force]` | Copy this binary to the stable path atomically (what Homebrew and the installer run); refuses ad-hoc builds, downgrades, and signing-team changes |
 | `rcc doctor [--json]` | Check every part of the install, with remediation for anything broken |
 | `rcc status [--json]` | One-line health snapshot |
 | `rcc serve` | MCP server over stdio — what Claude Desktop spawns |

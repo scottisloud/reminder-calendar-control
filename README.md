@@ -8,8 +8,9 @@ Personal-use, single-machine, macOS 26+. See [SPEC.md](SPEC.md) for the full des
 
 ## Status
 
-**Milestones 1–6 of 7 done, plus the daily-driver write surface.** Next: Milestone 7 —
-Tier 1 (LLM-in-the-loop) automation.
+**Milestones 1–6 done, plus the daily-driver write surface.** Milestone 7 (Tier 1,
+LLM-in-the-loop automation) was dropped: for scheduled judgment, use a Claude scheduled
+task (or just ask) and let it call rcc's tools.
 
 **M6 — Tier 0 automation.** Rules that run on a schedule with no chat open: flag meetings
 with no location or back-to-back meetings, or clear out old completed reminders. Anything

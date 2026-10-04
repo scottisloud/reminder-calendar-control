@@ -8,8 +8,14 @@ Personal-use, single-machine, macOS 26+. See [SPEC.md](SPEC.md) for the full des
 
 ## Status
 
-**Milestones 1–5 of 7 done, plus the daily-driver write surface** (M4 core; the
-automation-only staging flow is M6). Next: Milestone 6 — Tier 0 automation.
+**Milestones 1–6 of 7 done, plus the daily-driver write surface.** Next: Milestone 7 —
+Tier 1 (LLM-in-the-loop) automation.
+
+**M6 — Tier 0 automation.** Rules that run on a schedule with no chat open: flag meetings
+with no location or back-to-back meetings, or clear out old completed reminders. Anything
+destructive is only ever *staged*; it runs when you type `rcc automations approve <id>`
+in Terminal, and never from Claude (there is no tool for it, and approval needs a real
+terminal). [docs/milestone-6.md](docs/milestone-6.md).
 
 **M5 — release proof.** Install, update (`setup --verify`), and uninstall proven live;
 uninstall never changes Calendar or Reminders data. Full write round trips on iCloud,
@@ -108,7 +114,10 @@ replacing one file is a true atomic rename; replacing a bundle is not.
 | `rcc status [--json]` | One-line health snapshot |
 | `rcc serve` | MCP server over stdio — what Claude Desktop spawns |
 | `rcc selftest [--json] [--context <name>]` | Prove read/write against the dev fixtures from this launch context |
-| `rcc automations run` | What launchd invokes on a schedule (a no-op until Milestone 6) |
+| `rcc automations run [--dry-run] [--rule <id>]` | What launchd invokes every 30 minutes; `--dry-run` previews |
+| `rcc automations list\|show\|add <file>\|enable\|disable\|remove` | Manage rules (Claude can do the same over MCP) |
+| `rcc automations pending\|approve <id>\|reject <id>` | Review staged changes; **approve needs you at a terminal** |
+| `rcc automations log` | Recent runs and every audited write |
 
 Build the bundle on its own with `./Scripts/make-app-bundle.sh`.
 
@@ -120,7 +129,7 @@ anything.
 
 ```bash
 swift build            # debug
-swift test             # 246 tests, no EventKit or TCC involvement
+swift test             # 269 tests, no EventKit or TCC involvement
 ./Scripts/build-release.sh
 ./Scripts/m1-acceptance.sh
 Scripts/benchmark.py   # SPEC §7.3 measurements against the installed binary

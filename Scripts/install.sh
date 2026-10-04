@@ -95,12 +95,16 @@ fi
 # --skip-build takes SwiftPM's raw output, which is only linker-signed: Identifier is the
 # filename and the embedded Info.plist is NOT bound into the signature, so the usage strings
 # TCC needs are unsealed. Refuse to install that at the authoritative path.
-if codesign -dvvv "$BIN_PATH" 2>&1 | grep -q 'linker-signed'; then
+# Captured once, not piped into `grep -q`: under `set -o pipefail`, grep -q exiting at its
+# first match SIGPIPEs codesign, and the pipeline then "fails" depending on output size and
+# timing — which made the Info.plist check below refuse a correctly signed binary at M5.
+SIGNATURE_INFO="$(codesign -dvvv "$BIN_PATH" 2>&1 || true)"
+if printf '%s\n' "$SIGNATURE_INFO" | grep -q 'linker-signed'; then
   die "$BIN_PATH is only linker-signed — its Info.plist is not sealed.
       Run Scripts/build-release.sh (or Scripts/sign.sh --allow-adhoc \"$BIN_PATH\") first."
 fi
 codesign --verify --strict "$BIN_PATH" || die "signature verification failed for $BIN_PATH"
-codesign -dvvv "$BIN_PATH" 2>&1 | grep -q '^Info.plist entries=' \
+printf '%s\n' "$SIGNATURE_INFO" | grep -q '^Info.plist entries=' \
   || die "$BIN_PATH has no Info.plist sealed into its signature; TCC would have no usage strings"
 
 # 0700 on the product root as well as bin/: SPEC §13 says local state is 0700, and

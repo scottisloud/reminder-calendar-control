@@ -79,7 +79,7 @@ struct DoctorTests {
         let report = await Doctor(repository: InMemoryCalendarRepository(), disclaim: nil).run()
         for id in ["disclaim", "bundle_identity", "running_binary", "installed_binary",
                    "gatekeeper", "mcp_registration", "launch_agent", "state",
-                   "dev_fixture", "keychain", "notifications"] {
+                   "dev_fixture", "automation", "keychain", "notifications"] {
             _ = try check(report, id)
         }
     }

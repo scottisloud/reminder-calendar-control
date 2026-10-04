@@ -226,6 +226,25 @@ public struct MCPServer: Sendable {
                 return .success(Self.toolResult(Self.internalErrorPayload(error), isError: true))
             }
 
+        case let name where AutomationTools.names.contains(name):
+            if let gate = disclaimGate() { return gate }
+            guard let store else {
+                return .success(Self.toolResult(
+                    ["error": "the local state database is unavailable", "code": "state", "retryable": false],
+                    isError: true
+                ))
+            }
+            do {
+                let payload = try await AutomationTools.run(
+                    name, arguments: arguments, repository: repository, store: store
+                )
+                return .success(Self.toolResult(payload, isError: false))
+            } catch let error as ToolError {
+                return .success(Self.toolResult(error.payload, isError: true))
+            } catch {
+                return .success(Self.toolResult(Self.internalErrorPayload(error), isError: true))
+            }
+
         default:
             return .protocolError(-32602, "Unknown tool: \(name)")
         }
@@ -294,6 +313,12 @@ public struct MCPServer: Sendable {
         occurrence's `locator` plus `recurrence_scope`. Several reminders at once: \
         complete_reminders / update_reminders (one call, one confirmation). Every write \
         returns the item as saved — check it rather than re-reading.
+
+        Automations: create_automation sets up rules that run on a schedule with no chat \
+        open (flag = notify only; delete = staged). Nothing an automation stages is ever \
+        executed until the user runs `rcc automations approve <id>` themselves in \
+        Terminal; there is no tool for approving, so point them at list_pending_actions' \
+        command instead of looking for another way.
 
         Events someone else organised (you are only an attendee) are read-only here: \
         changing or deleting an invitation can send the organiser a reply, so those writes \

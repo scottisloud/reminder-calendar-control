@@ -14,10 +14,8 @@ struct RCCCommand: AsyncParsableCommand {
         discussion: """
             rcc is a single binary with several modes. `rcc setup` is the one you run by \
             hand; `rcc serve` is what Claude Desktop spawns; `rcc automations run` is what \
-            launchd invokes on a schedule.
-
-            Milestone 1 scope: platform and packaging proof. Calendar and reminder CRUD \
-            arrive in later milestones.
+            launchd invokes on a schedule. `rcc automations approve` is the only way a \
+            staged automation change is ever executed, and it needs you at a terminal.
             """,
         version: BuildInfo.versionString,
         subcommands: [

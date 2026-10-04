@@ -44,6 +44,7 @@ public struct Doctor: Sendable {
         checks.append(launchAgentCheck())
         checks.append(stateCheck())
         checks.append(await devFixtureCheck())
+        checks.append(automationCheck())
         checks.append(keychainCheck())
         checks.append(notificationCheck())
         return HealthReport(generatedAt: now, checks: checks)
@@ -578,6 +579,41 @@ public struct Doctor: Sendable {
             detail: unverified.isEmpty
                 ? "both provisioned and present"
                 : "both recorded (\(unverified.joined(separator: ", ")) not verifiable without access)",
+            facts: facts
+        )
+    }
+
+    /// Rules, their last outcomes, and what is waiting for approval (SPEC §11, §14). A rule
+    /// whose last run failed or stopped at its fan-out limit is a warning — the whole
+    /// point of the run log is that nothing fails silently.
+    func automationCheck() -> HealthReport.Check {
+        guard FileManager.default.fileExists(atPath: RCCPaths.databaseFile.path),
+              let store = try? Store(), let rules = try? store.rules() else {
+            return HealthReport.Check(id: "automation", title: "Automations", status: .skipped, detail: "no state database yet")
+        }
+        let pending = (try? store.stagedActions(states: ["pending"]))?.count ?? 0
+        let enabled = rules.filter(\.enabled)
+        let troubled = enabled.filter { ["failed", "fan_out_exceeded"].contains($0.lastOutcome ?? "") }
+        var facts: [String: String] = [
+            "rules": String(rules.count), "enabled": String(enabled.count), "pending_actions": String(pending),
+        ]
+        if !troubled.isEmpty { facts["troubled_rules"] = troubled.map(\.id).joined(separator: ",") }
+        guard !rules.isEmpty else {
+            return HealthReport.Check(id: "automation", title: "Automations", status: .skipped,
+                                      detail: "no rules configured", facts: facts)
+        }
+        if !troubled.isEmpty {
+            return HealthReport.Check(
+                id: "automation", title: "Automations", status: .warn,
+                detail: "\(troubled.count) rule(s) did not complete their last run: \(troubled.map(\.name).joined(separator: ", "))",
+                remediation: "See `rcc automations log`; preview with `rcc automations run --dry-run --rule <id>`.",
+                facts: facts
+            )
+        }
+        return HealthReport.Check(
+            id: "automation", title: "Automations", status: .ok,
+            detail: "\(enabled.count) of \(rules.count) rule(s) on"
+                + (pending > 0 ? "; \(pending) staged action(s) awaiting `rcc automations approve`" : ""),
             facts: facts
         )
     }

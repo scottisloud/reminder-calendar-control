@@ -36,6 +36,30 @@ public struct DevFixtureManager: Sendable {
             return existing
         }
 
+        // Uninstall never deletes calendars (SPEC §6.1), so after a state purge and a
+        // reinstall the old fixture is still sitting in the user's account. Adopt it rather
+        // than leave it stranded beside a new one. Matching is on rcc's own unmistakable
+        // title shape, and the calendar must hold only this entity type.
+        let prefix = "\(Self.titlePrefix) \(entityType.rawValue)s "
+        if let existing = try await repository.calendars(for: entityType)
+            .filter({ $0.title.hasPrefix(prefix) && $0.allowedEntityTypes == [entityType] && $0.isWritable })
+            .sorted(by: { $0.id < $1.id }).first {
+            let fixture = Store.DevFixture(
+                entityType: entityType.fixtureEntityType,
+                calendarID: existing.id,
+                title: existing.title,
+                sourceID: existing.sourceIdentifier,
+                sourceTitle: existing.sourceTitle,
+                createdAt: RCCTime.instant()
+            )
+            try store.recordDevFixture(fixture)
+            Log.shared.info("devfixture.adopted", [
+                "entity": .safe(entityType.rawValue),
+                "calendar": .safe(existing.id),
+            ])
+            return fixture
+        }
+
         let source = try await preferredSource(for: entityType)
         // Suffixed so two provisions never collide, and so `create_event`'s
         // duplicate-display-name rule (SPEC §10) is never tripped by our own fixture.

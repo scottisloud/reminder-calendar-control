@@ -376,3 +376,78 @@ extension DailyDriverTests {
         #expect(plain["note"] == nil)
     }
 }
+
+extension DailyDriverTests {
+    @Test("Paging through list_reminders visits every item exactly once, in the documented order")
+    func pagedReminders() async throws {
+        let f = try await fixture()
+        for n in 0..<7 {
+            _ = try await f.write(WriteTools.createReminder, [
+                "list": "Personal", "title": "r\(n)", "due": "2026-10-\(String(format: "%02d", 10 - n))",
+            ])
+        }
+        var seen: [String] = []
+        var cursor: String?
+        repeat {
+            var args: [String: Any] = ["limit": 3]
+            if let cursor { args["cursor"] = cursor }
+            let envelope = try await f.read(ReadTools.listReminders, args)
+            let rows = try #require(envelope["data"] as? [[String: Any]])
+            seen += rows.compactMap { $0["title"] as? String }
+            let pagination = try #require(envelope["pagination"] as? [String: Any])
+            #expect(pagination["total_matched"] as? Int == 7)
+            cursor = pagination["next_cursor"] as? String
+        } while cursor != nil
+        #expect(seen == ["r6", "r5", "r4", "r3", "r2", "r1", "r0"])  // soonest due first
+    }
+
+    @Test("queryEvents' reference implementation is list + filter + slice")
+    func queryEventsContract() async throws {
+        let f = try await fixture()
+        for n in 0..<5 {
+            _ = try await f.write(WriteTools.createEvent, [
+                "calendar": "Home", "title": n.isMultiple(of: 2) ? "gym \(n)" : "work \(n)",
+                "start": "2026-10-1\(n)T15:00:00Z",
+            ])
+        }
+        let page = try await f.repo.queryEvents(EventQuery(
+            from: RCCTime.parse("2026-10-01T00:00:00Z")!, to: RCCTime.parse("2026-11-01T00:00:00Z")!,
+            text: "gym", offset: 1, limit: 1
+        ))
+        #expect(page.totalMatched == 3)
+        #expect(page.items.map(\.title) == ["gym 2"])
+    }
+}
+
+extension DailyDriverTests {
+    @Test("An invitation from someone else is refused for update and delete; an own event is not")
+    func invitationsAreReadOnly() async throws {
+        let f = try await fixture()
+        func person(_ name: String, me: Bool, role: String) -> Participant {
+            Participant(name: name, url: "mailto:\(name)@example.com", email: "\(name)@example.com",
+                        isCurrentUser: me, type: EnumValue(name: "person", raw: 1),
+                        role: EnumValue(name: role, raw: 1), status: EnumValue(name: "accepted", raw: 2))
+        }
+        let start = RCCTime.parse("2026-10-20T16:00:00Z")!
+        await f.repo.insert(event: EventSummary(
+            id: "invite", title: "Their meeting", start: start, end: start.addingTimeInterval(1800),
+            calendarIdentifier: "cal-work",
+            participants: [person("pat", me: false, role: "chair"), person("scott", me: true, role: "required")],
+            organizer: person("pat", me: false, role: "chair")
+        ))
+        await expectError("unsupported") {
+            _ = try await f.write(WriteTools.updateEvent, ["identifier": "invite", "patch": ["title": "x"]])
+        }
+        await expectError("unsupported") {
+            _ = try await f.write(WriteTools.deleteEvent, ["identifier": "invite"])
+        }
+
+        await f.repo.insert(event: EventSummary(
+            id: "mine", title: "My meeting", start: start, end: start.addingTimeInterval(1800),
+            calendarIdentifier: "cal-work",
+            participants: [person("scott", me: true, role: "chair"), person("pat", me: false, role: "required")],
+            organizer: person("scott", me: true, role: "chair")
+        ))
+        _ = try await f.write(WriteTools.updateEvent, ["identifier": "mine", "patch": ["title": "My meeting (moved)"]])
+    }
+}

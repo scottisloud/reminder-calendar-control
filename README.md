@@ -8,9 +8,16 @@ Personal-use, single-machine, macOS 26+. See [SPEC.md](SPEC.md) for the full des
 
 ## Status
 
-**Milestones 1–4 of 7 done, plus the daily-driver write surface** (M4 core; the
-automation-only staging flow is M6). Next: Milestone 5 — release proof (install/uninstall,
-provider matrix, iOS parity, benchmarks).
+**Milestones 1–5 of 7 done, plus the daily-driver write surface** (M4 core; the
+automation-only staging flow is M6). Next: Milestone 6 — Tier 0 automation.
+
+**M5 — release proof.** Install, update (`setup --verify`), and uninstall proven live;
+uninstall never changes Calendar or Reminders data. Full write round trips on iCloud,
+Google (which surfaces as CalDAV), and Fastmail. iOS parity corpus 18/18 on the rcc side
+([docs/parity-corpus.md](docs/parity-corpus.md)). Measured: idle CPU 0.0%, 29 ms startup,
+12–17 ms everyday reads, 0.83 s for three years of events. Measuring found a 20× listing
+slowdown and a per-query memory leak in `rcc serve`; both fixed.
+[docs/milestone-5-findings.md](docs/milestone-5-findings.md).
 
 **M1 — platform & packaging proof.** Claude Desktop can talk to `rcc` end to end: a
 Desktop-spawned `rcc serve` has full Calendar and Reminders access and passes its platform
@@ -96,7 +103,7 @@ replacing one file is a true atomic rename; replacing a bundle is not.
 
 | Command | What it does |
 |---|---|
-| `rcc setup [--dev] [--verify] [--uninstall]` | Grant access, register with Claude Desktop, install the LaunchAgent |
+| `rcc setup [--dev] [--verify] [--uninstall]` | Grant access, register with Claude Desktop, install the LaunchAgent. `--verify` after an update; `--uninstall [--keep-state\|--purge-state] [--remove-binary]` removes rcc and never touches Calendar or Reminders data; `--remove-dev` deletes only the `--dev` test calendar and list |
 | `rcc doctor [--json]` | Check every part of the install, with remediation for anything broken |
 | `rcc status [--json]` | One-line health snapshot |
 | `rcc serve` | MCP server over stdio — what Claude Desktop spawns |
@@ -113,9 +120,11 @@ anything.
 
 ```bash
 swift build            # debug
-swift test             # 240 tests, no EventKit or TCC involvement
+swift test             # 246 tests, no EventKit or TCC involvement
 ./Scripts/build-release.sh
 ./Scripts/m1-acceptance.sh
+Scripts/benchmark.py   # SPEC §7.3 measurements against the installed binary
+Scripts/parity.py      # rcc side of docs/parity-corpus.md (writes only to the dev fixtures)
 ```
 
 Everything above the `CalendarRepository` protocol is testable against an in-memory fake,

@@ -16,15 +16,27 @@ public enum RCCID {
     public static func locatorHandle() -> String {
         var bytes = [UInt8](repeating: 0, count: 20)
         for index in bytes.indices { bytes[index] = UInt8.random(in: .min ... .max) }
-        return bytes.map { String(format: "%02x", $0) }.joined()
+        return hex(bytes)
     }
 
     /// SHA-256 of a canonical string, lowercase hex. Used for `operation_hash` and, later,
     /// the `version` a mutable DTO carries for `if_match`.
     public static func hash(_ canonical: String) -> String {
-        SHA256.hash(data: Data(canonical.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        hex(SHA256.hash(data: Data(canonical.utf8)))
+    }
+
+    /// Lowercase hex. `String(format: "%02x")` per byte was the single largest CPU cost of
+    /// listing a few thousand events (a `version` is ~25 SHA-256s); a lookup table is the
+    /// same output at a fraction of the cost.
+    static func hex<Bytes: Sequence>(_ bytes: Bytes) -> String where Bytes.Element == UInt8 {
+        let digits = Array("0123456789abcdef".utf8)
+        var out = [UInt8]()
+        out.reserveCapacity(64)
+        for byte in bytes {
+            out.append(digits[Int(byte >> 4)])
+            out.append(digits[Int(byte & 0x0f)])
+        }
+        return String(decoding: out, as: UTF8.self)
     }
 }
 

@@ -14,7 +14,7 @@ import SQLite3
 public final class Store: @unchecked Sendable {
     /// Bump this and append to `migrations` for every schema change. Never edit an
     /// existing migration — a released binary has already applied it.
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
 
     private let handle: OpaquePointer
     public let url: URL
@@ -139,6 +139,82 @@ public final class Store: @unchecked Sendable {
             ON operation_journal (idempotency_key) WHERE idempotency_key IS NOT NULL;
         CREATE INDEX IF NOT EXISTS operation_journal_state ON operation_journal (state);
         CREATE INDEX IF NOT EXISTS operation_journal_prepared ON operation_journal (prepared_at);
+        """,
+
+        // v3 — Milestone 6 Tier 0 automation (SPEC §8.3, §11, §14).
+        """
+        -- A rule is a validated, versioned DSL document (`definition_json`); scheduling
+        -- state lives beside it. The lease columns are the per-rule mutex that stops a rule
+        -- double-firing (§11.3): a run claims the lease with a conditional UPDATE and must
+        -- see exactly one changed row before it may proceed.
+        CREATE TABLE IF NOT EXISTS automation_rules (
+            id                    TEXT PRIMARY KEY,
+            name                  TEXT NOT NULL,
+            enabled               INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            definition_json       TEXT NOT NULL,
+            dsl_version           INTEGER NOT NULL,
+            created_at            TEXT NOT NULL,
+            updated_at            TEXT NOT NULL,
+            next_due_at           TEXT,
+            lease_owner           TEXT,
+            lease_expires_at      TEXT,
+            consecutive_failures  INTEGER NOT NULL DEFAULT 0,
+            last_run_at           TEXT,
+            last_outcome          TEXT
+        );
+
+        -- One row per firing, including misfires and failures, so nothing fails silently.
+        CREATE TABLE IF NOT EXISTS automation_runs (
+            id                TEXT PRIMARY KEY,
+            rule_id           TEXT NOT NULL,
+            scheduled_for     TEXT,
+            started_at        TEXT NOT NULL,
+            finished_at       TEXT,
+            outcome           TEXT NOT NULL CHECK (outcome IN (
+                                  'running', 'nothing', 'flagged', 'staged', 'skipped_misfire',
+                                  'fan_out_exceeded', 'failed', 'dry_run')),
+            matched           INTEGER,
+            staged_action_id  TEXT,
+            detail            TEXT
+        );
+        CREATE INDEX IF NOT EXISTS automation_runs_rule ON automation_runs (rule_id, started_at);
+
+        -- Staged actions (§8.3): everything needed to execute later against exactly what
+        -- was previewed — each item's identifier and `version` — plus an expiry and a
+        -- one-use decision. `items_json` carries truncated, sanitised titles: a human
+        -- cannot approve a deletion they cannot see.
+        CREATE TABLE IF NOT EXISTS staged_actions (
+            id            TEXT PRIMARY KEY,
+            rule_id       TEXT,
+            run_id        TEXT,
+            kind          TEXT NOT NULL,
+            impact        TEXT NOT NULL,
+            summary       TEXT NOT NULL,
+            items_json    TEXT NOT NULL,
+            state         TEXT NOT NULL CHECK (state IN (
+                              'pending', 'executing', 'executed', 'partially_executed',
+                              'rejected', 'expired', 'stale')),
+            created_at    TEXT NOT NULL,
+            expires_at    TEXT NOT NULL,
+            decided_at    TEXT,
+            result_json   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS staged_actions_state ON staged_actions (state);
+
+        -- Audit log (§14). Append-only by application invariant — rcc never issues UPDATE
+        -- or DELETE against it — not tamper-evident. Identifiers and hashes, no content.
+        CREATE TABLE IF NOT EXISTS audit_log (
+            seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+            at            TEXT NOT NULL,
+            context       TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            target        TEXT,
+            operation_id  TEXT,
+            operation_hash TEXT,
+            approval_id   TEXT,
+            outcome       TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS audit_log_at ON audit_log (at);
         """
     ]
 

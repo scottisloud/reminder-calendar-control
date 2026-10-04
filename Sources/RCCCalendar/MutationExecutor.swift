@@ -56,13 +56,17 @@ public struct MutationExecutor: Sendable {
         public var idempotencyKey: String?
         /// Canonical arguments as JSON, already stripped of note/content text (SPEC §13).
         public var intentJSON: String
+        /// The staged action this mutation executes, when it runs under an approval
+        /// (SPEC §8.3) — recorded in the audit log.
+        public var approvalID: String?
 
         public init(
             action: Action, context: OperationContext = .live,
             targetLocator: String? = nil, targetIdentifier: String? = nil,
             ifMatch: String? = nil, recurrenceScope: RecurrenceScope? = nil,
-            idempotencyKey: String? = nil, intentJSON: String = "{}"
+            idempotencyKey: String? = nil, intentJSON: String = "{}", approvalID: String? = nil
         ) {
+            self.approvalID = approvalID
             self.action = action
             self.context = context
             self.targetLocator = targetLocator
@@ -155,6 +159,7 @@ public struct MutationExecutor: Sendable {
                 try store.recordResultIdentifier(identifier, for: op.id)
             }
             try store.markSucceeded(op.id, resultIdentifier: result.resultIdentifier)
+            audit(request, kind: kind, op: op, target: result.resultIdentifier ?? request.targetIdentifier, outcome: "succeeded")
             return Outcome(
                 operationID: op.id, resultIdentifier: result.resultIdentifier,
                 locator: result.locator, version: result.version,
@@ -163,9 +168,11 @@ public struct MutationExecutor: Sendable {
             )
         } catch let error as ExecutorError {
             try? store.markFailed(op.id, errorCode: error.code, detail: "\(error)")
+            audit(request, kind: kind, op: op, target: request.targetIdentifier, outcome: "failed:\(error.code)")
             throw error
         } catch let error as CalendarRepositoryError {
             try? store.markFailed(op.id, errorCode: error.code, detail: error.description)
+            audit(request, kind: kind, op: op, target: request.targetIdentifier, outcome: "failed:\(error.code)")
             throw ExecutorError.repository(code: error.code, message: error.description)
         }
         // Any other throw (e.g. a SQLite error at markSucceeded) is left uncaught: the row
@@ -173,6 +180,22 @@ public struct MutationExecutor: Sendable {
     }
 
     // MARK: - Internals
+
+    /// One audit-log entry per completed mutation (SPEC §14). Best-effort: the write has
+    /// already happened (or definitively failed) and the journal row records it, so an
+    /// audit insert failing must not turn a completed write into a reported failure.
+    private func audit(
+        _ request: Request, kind: OperationKind, op: OperationRecord, target: String?, outcome: String
+    ) {
+        do {
+            try store.appendAudit(
+                context: request.context, kind: kind.rawValue, target: target, operationID: op.id,
+                operationHash: op.operationHash, approvalID: request.approvalID, outcome: outcome
+            )
+        } catch {
+            Log.shared.error("audit.append_failed", ["operation": .safe(op.id)])
+        }
+    }
 
     private struct PerformResult {
         var resultIdentifier: String?
@@ -432,6 +455,23 @@ public struct MutationExecutor: Sendable {
             // Outside the window the unique index still holds the row, so the key cannot be
             // reused for a fresh operation.
             throw ExecutorError.conflict(current: "idempotency key reused outside the \(Int(idempotencyRetention / 86400))-day replay window")
+        }
+        // A replay reports what actually happened the first time. Returning a plain outcome
+        // for a key whose first attempt failed made a retry of a refused write look like
+        // success (found at M6, where resuming an interrupted approval depends on it).
+        switch prior.state {
+        case .succeeded, .reconciled:
+            break
+        case .failed:
+            throw ExecutorError.repository(
+                code: prior.errorCode ?? "internal",
+                message: "replayed: the original attempt failed — \(prior.outcomeDetail ?? prior.errorCode ?? "unknown error")"
+            )
+        case .prepared, .executing, .outcomeUnknown, .needsHumanReview:
+            throw ExecutorError.repository(
+                code: "outcome_unknown",
+                message: "replayed: the original attempt has not finished or needs review; it will not be retried blindly"
+            )
         }
         return Outcome(
             operationID: prior.id, resultIdentifier: prior.resultIdentifier,

@@ -70,18 +70,27 @@ let package = Package(
             swiftSettings: commonSwiftSettings
         ),
 
+        // Tier 0 automation (SPEC §11): the rule DSL, scheduling, staging, and approval
+        // execution. Depends on the calendar layer, never on the MCP server — approval has
+        // no MCP path (SPEC §8.3).
+        .target(
+            name: "RCCAutomation",
+            dependencies: ["RCCCalendar", "RCCCore"],
+            swiftSettings: commonSwiftSettings
+        ),
+
         // Hand-rolled MCP stdio server. See docs/milestone-1.md for why this is not the
         // official Swift SDK.
         .target(
             name: "RCCMCP",
-            dependencies: ["RCCCalendar", "RCCCore", "RCCDiagnostics"],
+            dependencies: ["RCCAutomation", "RCCCalendar", "RCCCore", "RCCDiagnostics"],
             swiftSettings: commonSwiftSettings
         ),
 
         .executableTarget(
             name: "rcc",
             dependencies: [
-                "RCCBootstrap", "RCCCalendar", "RCCCore", "RCCDiagnostics", "RCCMCP", "RCCPlatform",
+                "RCCAutomation", "RCCBootstrap", "RCCCalendar", "RCCCore", "RCCDiagnostics", "RCCMCP", "RCCPlatform",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             swiftSettings: commonSwiftSettings,
@@ -117,6 +126,11 @@ let package = Package(
         .testTarget(
             name: "RCCMCPTests",
             dependencies: ["RCCMCP", "RCCCore", "RCCCalendar"],
+            swiftSettings: commonSwiftSettings
+        ),
+        .testTarget(
+            name: "RCCAutomationTests",
+            dependencies: ["RCCAutomation", "RCCCalendar", "RCCCore"],
             swiftSettings: commonSwiftSettings
         ),
         .testTarget(

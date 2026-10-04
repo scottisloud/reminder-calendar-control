@@ -115,7 +115,7 @@ struct MCPServerTests {
     @Test("Every advertised tool has a name, a description, and an object input schema")
     func toolDescriptorShape() throws {
         let tools = Tools.descriptors
-        #expect(tools.count == 2 + ReadTools.names.count + WriteTools.names.count)
+        #expect(tools.count == 2 + ReadTools.names.count + WriteTools.names.count + AutomationTools.names.count)
         var names = Set<String>()
         for tool in tools {
             let name = try #require(tool["name"] as? String)
@@ -135,7 +135,9 @@ struct MCPServerTests {
     @Test("Only genuinely read-only tools claim to be read-only")
     func readOnlyHintIsHonest() throws {
         // The only tool that writes anything.
-        let mutating = WriteTools.names.union([Tools.runPlatformSelfTest])
+        let mutating = WriteTools.names.union([Tools.runPlatformSelfTest]).union([
+            AutomationTools.createAutomation, AutomationTools.updateAutomation, AutomationTools.deleteAutomation,
+        ])
         for tool in Tools.descriptors {
             let name = try #require(tool["name"] as? String)
             let annotations = try #require(tool["annotations"] as? [String: Any])
@@ -158,7 +160,19 @@ struct MCPServerTests {
         ))
         let tools = try #require((response["result"] as? [String: Any])?["tools"] as? [[String: Any]])
         let names = Set(tools.compactMap { $0["name"] as? String })
-        #expect(names == ReadTools.names.union(WriteTools.names).union([Tools.getSystemStatus, Tools.runPlatformSelfTest]))
+        #expect(names == ReadTools.names.union(WriteTools.names).union(AutomationTools.names)
+            .union([Tools.getSystemStatus, Tools.runPlatformSelfTest]))
+    }
+
+    /// SPEC §8.3/§6.4: a model-callable approval tool would not prove a human approved
+    /// anything. This must stay true forever, whatever else is added.
+    @Test("No MCP tool can approve, reject, or execute a staged action")
+    func noApprovalTool() {
+        for tool in Tools.descriptors {
+            let name = (tool["name"] as? String ?? "").lowercased()
+            #expect(!name.contains("approve") && !name.contains("reject") && !name.contains("execute"),
+                    "\(name) looks like an approval path")
+        }
     }
 
     @Test("A read tool runs end to end and returns the envelope in structuredContent")

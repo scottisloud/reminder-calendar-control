@@ -24,6 +24,13 @@ public enum RCCTime {
         return try? Date(string, strategy: Date.ISO8601FormatStyle(timeZone: .gmt))
     }
 
+    /// RFC 3339 wall-clock time in `zone`, with its UTC offset and no fractional seconds:
+    /// `2026-10-06T07:00:00-07:00`. For values a person reads as local time; `instant(_:)`
+    /// stays the machine form.
+    public static func local(_ date: Date, zone: TimeZone = .current) -> String {
+        Date.ISO8601FormatStyle(timeZoneSeparator: .colon, timeZone: zone).format(date)
+    }
+
     /// Local calendar date, `YYYY-MM-DD`. Used for daily log-file names, where the
     /// operator's expectation is "today's log", not "today in UTC".
     public static func localDay(_ date: Date = Date(), calendar: Calendar = .current) -> String {

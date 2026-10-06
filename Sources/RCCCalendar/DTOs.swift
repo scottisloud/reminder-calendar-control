@@ -286,3 +286,25 @@ public enum ReminderDueWindow: String, Sendable, CaseIterable {
         }
     }
 }
+
+/// Named day ranges for event queries, so a caller asking about "today" need not work out
+/// local midnight and its UTC offset itself. Same day boundaries as `ReminderDueWindow`.
+public enum EventWindow: String, Sendable, CaseIterable {
+    case today
+    case tomorrow
+    case next7Days = "next_7_days"
+
+    /// The half-open range `[start, end)` this window covers at `now` in `zone`. Boundaries
+    /// are local midnights, so a day with a DST change is 23 or 25 hours long.
+    public func interval(now: Date = Date(), zone: TimeZone = .current) -> (start: Date, end: Date) {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        let startOfToday = calendar.startOfDay(for: now)
+        func day(_ offset: Int) -> Date { calendar.date(byAdding: .day, value: offset, to: startOfToday)! }
+        switch self {
+        case .today: return (startOfToday, day(1))
+        case .tomorrow: return (day(1), day(2))
+        case .next7Days: return (startOfToday, day(7))
+        }
+    }
+}

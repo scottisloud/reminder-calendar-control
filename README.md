@@ -79,7 +79,7 @@ Reading:
 
 - `list_sources` — the accounts on this Mac (iCloud, Google, Exchange, …).
 - `list_calendars`, `list_reminder_lists` — calendars and reminder lists, with `is_default` on the default of each.
-- `list_events`, `search_events` — events in a `from`/`to` window (RFC 3339); search also matches text or an attendee.
+- `list_events`, `search_events` — events for a named `window` (`today`, `tomorrow`, `next_7_days`, in local time) or an RFC 3339 `from`/`to` range; search also matches text or an attendee.
 - `get_event` — one event with notes, attendees, alarms and recurrence.
 - `list_reminders`, `search_reminders` — reminders, soonest first; `due_window` accepts `overdue`, `today`, `overdue_or_today` and `next_7_days`, in local time.
 - `get_reminder` — one reminder in full.
@@ -105,8 +105,8 @@ Conventions that matter when calling them:
 
 - **Names work as ids.** Anywhere a calendar or list id is accepted, a title such as `"Personal"` works too. An ambiguous title returns `ambiguous_target` with the candidates. When the user names no list or calendar, use the one marked `is_default` and say which you used.
 - **Days and times are different.** A reminder due `"2026-10-05"` is due that day, has no time and is not overdue until the day ends. An RFC 3339 value is due at that moment and alerts then. Reads report `granularity` (`"date"` or `"datetime"`). Keep a day-only reminder day-only when rescheduling unless the user asks for a time.
-- **Event times are UTC.** `start` and `end` are UTC instants; `time_zone` is the event's own zone. All-day events also carry `start_date` and `end_date` as local dates, and `end_date` is the last day of the event, inclusive: a one-day event on 21 September has `start_date` and `end_date` both `2026-09-21`.
-- **Recurring events use locators.** Every occurrence of a series shares one `id`. To read a single occurrence, pass its `locator` from `list_events` to `get_event`. To change one, pass the `locator` plus `recurrence_scope`: `this_occurrence` or `this_and_future`. `occurrence_date` is the slot the occurrence was originally scheduled for, which differs from `start` when that one occurrence was moved; such an occurrence also reports `is_detached: true`.
+- **Event times come in UTC and local forms.** `start` and `end` are UTC instants, and `time_zone` is the event's own zone. Timed events add `start_local` and `end_local`, such as `2026-10-06T07:00:00-07:00`, in the Mac's time zone, which is the one to show the user. All-day events add `start_date` and `end_date` as local dates instead, and `end_date` is the last day of the event, inclusive: a one-day event on 21 September has both set to `2026-09-21`. `spans_multiple_days` is true for any event that runs past the end of its first local day, such as a training window that shows up in a single-day query.
+- **Recurring events use locators.** Every occurrence of a series shares one `id`. To read a single occurrence, pass its `locator` from `list_events` to `get_event`. To change one, pass the `locator` plus `recurrence_scope`: `this_occurrence` or `this_and_future`. Every occurrence reports `part_of_series: true`. `occurrence_date`, sent only for occurrences in a series, is the slot the occurrence was originally scheduled for, which differs from `start` when that one occurrence was moved. A moved occurrence reports `is_detached: true` and `is_recurring: false`, because it no longer carries the repeat rule itself.
 - **Use `if_match` for stale reads.** Every item has a `version`. Pass it as `if_match` when writing something read a while ago, so a change made elsewhere is refused instead of overwritten. Every write returns the item as saved.
 - **Data is live.** Re-read rather than reuse old results. An external edit invalidates outstanding page cursors (`cursor_stale`) and locators.
 

@@ -55,8 +55,10 @@ public enum ReadTools {
 
     private static func eventQueryProps() -> [String: Any] {
         var props: [String: Any] = [
-            "from": ["type": "string", "description": "Window start, RFC 3339."],
-            "to": ["type": "string", "description": "Window end, RFC 3339."],
+            "window": ["type": "string", "enum": EventWindow.allCases.map(\.rawValue),
+                       "description": "A named day range in the Mac's local time: 'today', 'tomorrow', or 'next_7_days' (today plus six). Use instead of `from`/`to`."],
+            "from": ["type": "string", "description": "Range start, RFC 3339. Pass with `to` when `window` does not fit."],
+            "to": ["type": "string", "description": "Range end, RFC 3339."],
             "calendar_ids": ["type": "array", "items": ["type": "string"],
                              "description": "Restrict to these calendars (ids or names); omit for all."],
             "text": ["type": "string", "description": "Match against title and location."],
@@ -71,13 +73,13 @@ public enum ReadTools {
         [
             [
                 "name": listSources,
-                "description": "List the calendar/reminder accounts (EKSource) configured on this Mac.",
+                "description": "List the calendar and reminder accounts on this Mac (iCloud, Google, Exchange, CalDAV, …), as Apple Calendar and Reminders see them.",
                 "inputSchema": schema([:]),
                 "annotations": readOnly("List Accounts"),
             ],
             [
                 "name": listCalendars,
-                "description": "List calendars and reminder lists. Optionally filter by `entity_type` ('event' or 'reminder').",
+                "description": "List the Mac's calendars and reminder lists (Apple Calendar and Reminders, every account). Optionally filter by `entity_type` ('event' or 'reminder'). The default of each kind is marked `is_default`.",
                 "inputSchema": schema([
                     "entity_type": ["type": "string", "enum": ["event", "reminder"]],
                 ]),
@@ -85,39 +87,47 @@ public enum ReadTools {
             ],
             [
                 "name": listReminderLists,
-                "description": "List reminder lists (calendars that hold reminders).",
+                "description": "List the Mac's reminder lists (Apple Reminders, every account). The default list is marked `is_default`.",
                 "inputSchema": schema([:]),
                 "annotations": readOnly("List Reminder Lists"),
             ],
             [
                 "name": listEvents,
                 "description": """
-                    List calendar events in a bounded time window. `from` and `to` are \
-                    required RFC 3339 timestamps; a window over four years is walked in \
-                    chunks automatically. Optional `text` / `attendee` narrow the result \
-                    (post-fetch). Compact projection unless `include_details` is set.
+                    List calendar events — today's schedule, the week's agenda, any date \
+                    range — from Apple Calendar on this Mac (iCloud, Google, Exchange, CalDAV). \
+                    Pass `window` ('today', 'tomorrow', 'next_7_days', in local time) or an \
+                    RFC 3339 `from`/`to` range, not both. Optional `text` / `attendee` narrow \
+                    the result. `start`/`end` are UTC; timed events add `start_local`/\
+                    `end_local` in the Mac's time zone, and all-day events add \
+                    `start_date`/`end_date` (both inclusive). `spans_multiple_days` flags \
+                    events longer than one local day. Compact rows unless `include_details`.
                     """,
-                "inputSchema": schema(eventQueryProps(), required: ["from", "to"]),
+                "inputSchema": schema(eventQueryProps()),
                 "annotations": readOnly("List Events"),
             ],
             [
                 "name": searchEvents,
                 "description": """
-                    Search calendar events by free text (`text`, matched against title, \
-                    location, and — with `search_notes` — notes) or by `attendee` (name, \
-                    email, or URL), within the required `from`/`to` window. One of `text` \
-                    or `attendee` is required.
+                    Search calendar events (Apple Calendar, every account) by free text \
+                    (`text`, matched against title, location, and — with `search_notes` — \
+                    notes) or by `attendee` (name, email, or URL). One of `text` or \
+                    `attendee` is required, plus a `window` or a `from`/`to` range. Rows have \
+                    the same shape as list_events.
                     """,
-                "inputSchema": schema(eventQueryProps(), required: ["from", "to"]),
+                "inputSchema": schema(eventQueryProps()),
                 "annotations": readOnly("Search Events"),
             ],
             [
                 "name": getEvent,
                 "description": """
-                    Get one event with full detail (notes, attendees, alarms, recurrence). \
-                    For one occurrence of a recurring event pass its `locator` from \
-                    list_events (or `event_id` + `occurrence_date`); `event_id` alone returns \
-                    the series' first occurrence.
+                    Get one calendar event with full detail (notes, attendees, alarms, \
+                    recurrence). For one occurrence of a repeating event pass its `locator` \
+                    from list_events (or `event_id` + `occurrence_date`); `event_id` alone \
+                    returns the series' first occurrence. On a repeating event, \
+                    `part_of_series` is true and `occurrence_date` is the slot the occurrence \
+                    was originally scheduled for, which differs from `start` if that one \
+                    occurrence was moved (`is_detached` is then true and `is_recurring` false).
                     """,
                 "inputSchema": schema([
                     "event_id": ["type": "string"],
@@ -129,7 +139,8 @@ public enum ReadTools {
             [
                 "name": listReminders,
                 "description": """
-                    List reminders across lists, soonest due first. All filters optional: \
+                    List reminders due, overdue, or upcoming — the to-do list — across every \
+                    Apple Reminders list on this Mac, soonest due first. All filters optional: \
                     `due_window` ('overdue' | 'today' | 'overdue_or_today' | 'next_7_days', \
                     in local time, day-only reminders counted by their day), `completion` \
                     ('any'|'incomplete'|'completed'), `calendar_ids` (list ids or names), a \
@@ -157,7 +168,7 @@ public enum ReadTools {
             ],
             [
                 "name": searchReminders,
-                "description": "Search reminders by free text (`text`, + `search_notes`). Same filters as list_reminders; `text` is required.",
+                "description": "Search reminders (Apple Reminders, every list) by free text (`text`, + `search_notes`). Same filters as list_reminders; `text` is required.",
                 "inputSchema": schema([
                     "text": ["type": "string"],
                     "search_notes": ["type": "boolean"],
@@ -172,7 +183,7 @@ public enum ReadTools {
             ],
             [
                 "name": getReminder,
-                "description": "Get one reminder by identifier, with full detail (notes, alerts, repeat rule).",
+                "description": "Get one reminder (Apple Reminders) by identifier, with full detail (notes, alerts, repeat rule).",
                 "inputSchema": schema([
                     "reminder_id": ["type": "string"],
                 ], required: ["reminder_id"]),
@@ -262,12 +273,7 @@ public enum ReadTools {
         _ generation: Int,
         requireQuery: Bool
     ) async throws -> [String: Any] {
-        guard let from = date(arguments["from"]), let to = date(arguments["to"]) else {
-            throw ToolError(code: "invalid_datetime", message: "`from` and `to` (RFC 3339) are required")
-        }
-        guard to > from else {
-            throw ToolError(code: "invalid_datetime", message: "`to` must be after `from`")
-        }
+        let (from, to) = try eventRange(arguments)
         let resolver = CalendarResolver(repository: repository)
         let calendarIDs = try await resolver.resolveFilter(stringArray(arguments["calendar_ids"]), entity: .event)
         let detail = bool(arguments["include_details"]) ?? false
@@ -288,7 +294,7 @@ public enum ReadTools {
         let page = Page(items: result.items, offset: offset, totalMatched: result.totalMatched,
                         currentGeneration: generation)
         let titles = await resolver.titles()
-        return envelope(
+        var out = envelope(
             data: page.items.map { event in
                 var row = project(event: event, detail: detail)
                 row["calendar_title"] = titles[event.calendarIdentifier] as Any? ?? NSNull()
@@ -304,6 +310,41 @@ public enum ReadTools {
             },
             pagination: paginationBlock(page)
         )
+        // A named window is resolved here, so say which range it meant.
+        if let window = string(arguments["window"]) {
+            out["window"] = ["name": window, "from": RCCTime.local(from), "to": RCCTime.local(to)]
+        }
+        return out
+    }
+
+    /// The query range: a named `window` in local time, or an explicit `from`/`to` — never
+    /// both, since a caller passing both has made a mistake one of them would hide.
+    static func eventRange(
+        _ arguments: [String: Any], now: Date = Date(), zone: TimeZone = .current
+    ) throws -> (Date, Date) {
+        if let raw = string(arguments["window"]) {
+            guard arguments["from"] == nil, arguments["to"] == nil else {
+                throw ToolError(code: "invalid_argument", message: "pass either `window` or `from`/`to`, not both")
+            }
+            guard let window = EventWindow(rawValue: raw) else {
+                throw ToolError(
+                    code: "invalid_argument",
+                    message: "`window` must be one of \(EventWindow.allCases.map(\.rawValue))"
+                )
+            }
+            let range = window.interval(now: now, zone: zone)
+            return (range.start, range.end)
+        }
+        guard let from = date(arguments["from"]), let to = date(arguments["to"]) else {
+            throw ToolError(
+                code: "invalid_datetime",
+                message: "pass `window` ('today', 'tomorrow', 'next_7_days') or both `from` and `to` (RFC 3339)"
+            )
+        }
+        guard to > from else {
+            throw ToolError(code: "invalid_datetime", message: "`to` must be after `from`")
+        }
+        return (from, to)
     }
 
     private static func runGetEvent(
@@ -524,7 +565,16 @@ public enum ReadTools {
         return out
     }
 
-    static func project(event: EventSummary, detail: Bool) -> [String: Any] {
+    /// `zone` is the one local values are shown in: the Mac's, which is the user's, rather
+    /// than the event's own `time_zone` (a meeting organised from New York still happens at
+    /// the user's local time).
+    static func project(event: EventSummary, detail: Bool, zone: TimeZone = .current) -> [String: Any] {
+        let partOfSeries = event.isRecurring || event.isDetached
+        var calendar = Calendar.current
+        calendar.timeZone = zone
+        // The last moment the event occupies: EventKit ends an all-day event at 23:59:59 on
+        // its last day, a timed one at an exclusive end. One second back is inside either.
+        let lastMoment = max(event.start, event.end.addingTimeInterval(-1))
         var out: [String: Any] = [
             "id": event.id,
             "title": event.title,
@@ -533,20 +583,29 @@ public enum ReadTools {
             "all_day": event.isAllDay,
             "calendar_id": event.calendarIdentifier,
             "is_recurring": event.isRecurring,
+            "part_of_series": partOfSeries,
+            "spans_multiple_days": !calendar.isDate(event.start, inSameDayAs: lastMoment),
             "version": event.version,
         ]
         if let tz = event.timeZoneIdentifier { out["time_zone"] = tz }
         if event.isAllDay {
             // An all-day event's instants are local midnights, which read as the wrong day
-            // in UTC. Its dates are what anyone means by it.
-            out["start_date"] = RCCTime.localDay(event.start)
-            out["end_date"] = RCCTime.localDay(event.end)
+            // in UTC. Its dates are what anyone means by it; `end_date` is its last day.
+            out["start_date"] = RCCTime.localDay(event.start, calendar: calendar)
+            out["end_date"] = RCCTime.localDay(event.end, calendar: calendar)
+        } else {
+            out["start_local"] = RCCTime.local(event.start, zone: zone)
+            out["end_local"] = RCCTime.local(event.end, zone: zone)
         }
         if let location = event.location { out["location"] = location }
         if let status = event.status { out["status"] = enumValue(status) }
         if let availability = event.availability { out["availability"] = enumValue(availability) }
         if event.isDetached { out["is_detached"] = true }
-        if let occurrence = event.occurrenceDate { out["occurrence_date"] = RCCTime.instant(occurrence) }
+        // The slot in the series this occurrence fills. EventKit reports one for every
+        // event, but outside a series it only repeats `start`.
+        if partOfSeries, let occurrence = event.occurrenceDate {
+            out["occurrence_date"] = RCCTime.instant(occurrence)
+        }
 
         guard detail else {
             out["has_notes"] = event.notes?.isEmpty == false

@@ -164,12 +164,10 @@ export RCC_NOTARY_PROFILE=<your-notarytool-profile>
 ```bash
 swift build
 swift test
-./Scripts/m1-acceptance.sh
 Scripts/benchmark.py
-Scripts/parity.py
 ```
 
-Everything above the `CalendarRepository` protocol runs against an in-memory fake, so `swift test` never touches a real calendar or triggers a permission prompt. Under `swift test`, every writable path (state, logs, LaunchAgents, the Claude Desktop config) is redirected to a throwaway directory. `benchmark.py` measures the installed binary against SPEC §7.3; `parity.py` runs rcc's side of the iOS parity corpus and writes only to the `--dev` test calendar and list.
+Everything above the `CalendarRepository` protocol runs against an in-memory fake, so `swift test` never touches a real calendar or triggers a permission prompt. Under `swift test`, every writable path (state, logs, LaunchAgents, the Claude Desktop config) is redirected to a throwaway directory. To check the installed binary against the real Calendar and Reminders stores, run `rcc setup --dev` once, then `rcc selftest`; it reads and writes only the `--dev` test calendar and list. `benchmark.py` measures the installed binary against SPEC §7.3's resource budget; pass `--json <file>` to save the results.
 
 ### Releasing
 
@@ -200,7 +198,10 @@ Sources/
 distribution/      the public tap's README, installer and cask template
 ```
 
-### Design documents
+### Design
 
-- [SPEC.md](SPEC.md) — the full design: trust boundaries, data model, write safety, the operation journal, automation.
-- [docs/parity-corpus.md](docs/parity-corpus.md) — the iOS parity test corpus.
+[SPEC.md](SPEC.md) is the full design: trust boundaries, data model, write safety, the operation journal and automation.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

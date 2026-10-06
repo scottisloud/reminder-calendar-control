@@ -1,191 +1,209 @@
-# reminder-calendar-control
+# rcc — Calendar and Reminders for Claude on macOS
 
-`rcc` — a native macOS tool that gives Claude Desktop read/write access to Calendar and
-Reminders through EventKit, plus an unattended automation layer that runs without any chat
-session open.
+`rcc` (reminder-calendar-control) gives Claude Desktop read and write access to your Mac's Calendar and Reminders. It is a small native Swift binary that runs as a local MCP server, talks to macOS through EventKit, and sees every account your Mac already syncs: iCloud, Google, Exchange, Fastmail and any other CalDAV account. It also runs scheduled automation rules on its own, with no chat open.
 
-Personal-use, single-machine, macOS 26+. See [SPEC.md](SPEC.md) for the full design.
+Nothing is sent anywhere by rcc itself. It has no telemetry and no network listener; Claude Desktop starts it and talks to it over stdio.
 
-## Status
+## What you can ask Claude to do
 
-**Milestones 1–6 done, plus the daily-driver write surface.** Milestone 7 (Tier 1,
-LLM-in-the-loop automation) was dropped: for scheduled judgment, use a Claude scheduled
-task (or just ask) and let it call rcc's tools.
+- "What's on my plate today?" — overdue and due-today reminders, and today's events, across every list and calendar.
+- "Move my 3pm with Sam to Thursday at 10." — create, edit, reschedule and delete events, including one occurrence of a repeating event, or that occurrence and every one after it.
+- "Remind me to renew my passport on the 15th." — reminders due on a day, or at a time with an alert; repeat rules, priority, notes, location and URL.
+- "Mark these five reminders done." — batch complete or update in one step, with one confirmation.
+- "Make a Groceries list." — create, rename and delete reminder lists.
+- "Every weekday morning, tell me about meetings with no location." — automation rules that run on a schedule without Claude open.
 
-**M6 — Tier 0 automation.** Rules that run on a schedule with no chat open: flag meetings
-with no location or back-to-back meetings, or clear out old completed reminders. Anything
-destructive is only ever *staged*; it runs when you type `rcc automations approve <id>`
-in Terminal, and never from Claude (there is no tool for it, and approval needs a real
-terminal). [docs/milestone-6.md](docs/milestone-6.md).
+## Requirements
 
-**M5 — release proof.** Install, update (`setup --verify`), and uninstall proven live;
-uninstall never changes Calendar or Reminders data. Full write round trips on iCloud,
-Google (which surfaces as CalDAV), and Fastmail. iOS parity corpus 18/18 on the rcc side
-([docs/parity-corpus.md](docs/parity-corpus.md)). Measured: idle CPU 0.0%, 29 ms startup,
-12–17 ms everyday reads, 0.83 s for three years of events. Measuring found a 20× listing
-slowdown and a per-query memory leak in `rcc serve`; both fixed.
-[docs/milestone-5-findings.md](docs/milestone-5-findings.md).
-
-**M1 — platform & packaging proof.** Claude Desktop can talk to `rcc` end to end: a
-Desktop-spawned `rcc serve` has full Calendar and Reminders access and passes its platform
-self-test.
-
-**M2 — core model & mutation journal.** Schema v2 adds the operation journal (a
-crash-safe `prepared → executing → succeeded|failed`, `executing → outcome_unknown`
-state machine), opaque server-issued locators with generation invalidation, idempotency
-keys with replay, a `RecurrenceRule` DTO that round-trips through EventKit, and
-`ContentVersion`/`if_match` for optimistic concurrency. `Reconciler.run()` recovers every
-mid-flight operation on startup — verified against a fault injected at every journal
-transition. The `if_match` / recurrence-scope / locator *enforcement* wiring lands with
-M4's write path.
-
-**M3 — read path.** Nine MCP read tools: `list_sources`, `list_calendars`,
-`list_reminder_lists`, `list_events`, `search_events`, `get_event`, `list_reminders`,
-`search_reminders`, `get_reminder`. The full §9.1–9.3 DTO model (every field, enum
-name+raw value, `DateComponents` granularity, a `version` per item). Opaque base64url page
-cursors; `MCPServer` watches `EKEventStoreChanged` and turns an outstanding cursor
-`cursor_stale` on any external edit.
-
-**M4 — write path.** Ten write tools (`create/update/delete_event`,
-`create/update/complete/delete_reminder`, `create/update/delete_reminder_list`), each run
-through `MutationExecutor`: the §9.6 journal sequence, `if_match` optimistic concurrency,
-locator resolution, recurrence-scope validation, idempotency replay, and omit/null/set
-patch semantics. `Reconciler` runs on `serve` startup. Verified live: full create → edit →
-conflict → delete lifecycle on a real event. 216 tests. The automation staging/impact
-matrix (§8.3) is Milestone 6.
-
-**Daily-driver write surface.** Lists and calendars by name ("Personal") anywhere an id
-is accepted; reminders due on a *day* or at a *time* (timed ones alert by default, and the
-alert follows a reschedule); repeat rules, alerts, priority, location, URL, and moves between
-lists/calendars on create and update; `complete_reminders` / `update_reminders` batches (one
-Desktop confirmation for many items); `list_reminders` `due_window` ("overdue_or_today");
-list rows labelled with their list's name; per-occurrence locators for recurring events.
-Fixed along the way: `list_events` collapsed every recurring series to its first
-occurrence, and occurrence-scoped edits/deletes hit the wrong occurrence. 240 tests.
-
-Built: the embedded `Info.plist` + Hardened Runtime + `personal-information` entitlements
-signing profile, notarization, one authoritative install path, the TCC self-disclaim
-mechanism (kept but redundant — Claude Desktop disclaims MCP servers itself), a foreground
-`NSApplication` grant flow for `rcc setup`, `rcc doctor`, the tool-owned dev calendar and
-reminder list, the EventKit adapter, and a hand-rolled MCP stdio server.
-
-The blocker that stood from the initial commit — a disclaimed headless binary could not
-obtain a Calendar/Reminders grant on macOS 26 — turned out to need two things a Developer
-ID signature alone did not provide: the `com.apple.security.personal-information.*`
-entitlements (macOS 26.5 gates the prompt on them) and a foreground `NSApplication` for the
-request. Plus a `read(2)` fix for a stdin hang that only a live MCP client triggered. Full
-account in [docs/milestone-1b-findings.md](docs/milestone-1b-findings.md).
-
-Calendar and reminder CRUD arrives in Milestones 3 and 4; automation in 6 and 7.
+- macOS 26 (Tahoe) or later, on Apple silicon.
+- Claude Desktop.
+- A person at the keyboard once, to approve the macOS Calendar and Reminders prompts.
 
 ## Install
 
+With Homebrew:
+
 ```bash
 brew install --cask scottisloud/tap/rcc
+```
+
+Then, in Terminal:
+
+```bash
 rcc setup
 ```
 
-Or, without Homebrew (or by asking an agent to install it from
-`github.com/scottisloud/homebrew-tap`):
+Without Homebrew (the script uses Homebrew anyway if it is installed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/scottisloud/homebrew-tap/main/install.sh | bash
 ```
 
-`rcc setup` is the one step that needs a person. macOS asks for Calendar and Reminders
-access, so approve both prompts. Setup then registers rcc with Claude Desktop and offers to
-restart it. The curl installer runs setup in your terminal, or opens a Terminal window for it
-when an agent runs the installer with no terminal attached.
+`rcc setup` asks macOS for Calendar and Reminders access (approve both prompts), registers rcc with Claude Desktop, installs the automation LaunchAgent, and offers to restart Claude Desktop so the new tools appear. The curl installer runs setup for you, or opens a Terminal window for it when it has no terminal attached.
 
-Either way, the downloaded binary only delivers itself: `rcc install` copies it atomically
-to `~/Library/Application Support/reminder-calendar-control/bin/rcc`, because macOS ties
-the permission grant to that path plus the signing identity. `rcc` on PATH is a link to that
-copy. `brew upgrade rcc` updates it the same way, and the grant carries over.
-`brew uninstall --zap rcc` removes everything except your Calendar and Reminders data,
-which rcc never touches.
+Releases are signed with Developer ID (team `T879Q2BE7Q`) and notarized by Apple; the installer checks both.
 
-### Releasing
+### Installing through an AI agent
 
-Releases are built and notarized on this Mac and published to the public tap
-(`scottisloud/homebrew-tap`). The tap's README, installer and cask template live in
-`distribution/homebrew-tap/`. Bump `BuildInfo.version`, commit, then:
+Ask the agent: *"Install rcc from github.com/scottisloud/homebrew-tap."* The agent should run the curl installer and nothing else. It must not run `rcc setup` itself: the macOS permission prompts need a person, and they are not granted from an agent's shell. The installer opens a Terminal window running `rcc setup` for the user. Afterwards, `rcc doctor` (safe from any shell) reports whether the install is healthy.
+
+### Where it lives
+
+macOS ties the Calendar and Reminders grant to one binary path and signing identity, so rcc always runs from `~/Library/Application Support/reminder-calendar-control/bin/rcc`. The `rcc` on your PATH is a symlink to it. Do not copy, move or re-sign that binary; the grant would stop applying.
+
+## Update and uninstall
 
 ```bash
-RCC_NOTARY_PROFILE=rcc-notary ./Scripts/release.sh --dry-run   # inspect ../homebrew-tap
-RCC_NOTARY_PROFILE=rcc-notary ./Scripts/release.sh
+brew upgrade rcc
 ```
 
-### Building from source
-
-Needs an Apple Developer ID certificate and a `notarytool` keychain profile, because
-macOS 26 won't show the Calendar/Reminders prompt to an ad-hoc binary.
+The permission grant carries over to the new version. Without Homebrew, re-run the curl installer.
 
 ```bash
-export RCC_NOTARY_PROFILE=<your-notarytool-profile>
-./Scripts/build-release.sh --notarize          # Developer ID + entitlements + notarize
-./Scripts/install.sh --skip-build              # atomic install to the stable path
-"$HOME/Library/Application Support/reminder-calendar-control/bin/rcc" setup --dev
+brew uninstall --zap rcc
 ```
 
-`setup` must run interactively from a real terminal (Terminal.app, Ghostty, …) and from
-the installed path. It brings up a foreground `NSApplication` to request access; a
-non-interactive run reports what is missing and exits non-zero.
+This removes the binary, the LaunchAgent, the Claude Desktop entry and rcc's state. A plain `brew uninstall rcc` leaves rcc registered and working. Without Homebrew, run `rcc setup --uninstall --purge-state --remove-binary`. Installing, updating and uninstalling never change your Calendar or Reminders data.
 
-A headless app bundle (`./Scripts/install.sh --bundle` → `RCC.app`, `LSUIElement`, no
-windows) exists only so the tool can carry an app icon, which a bare Mach-O cannot. It is
-not required for TCC — that was measured directly. The bare binary is the default because
-replacing one file is a true atomic rename; replacing a bundle is not.
+## Troubleshooting
+
+Run `rcc doctor`. It checks the installed binary and its signature, the Calendar and Reminders grants, the Claude Desktop registration, the LaunchAgent, rcc's state, the automation rules, Keychain and notifications, and prints a fix for anything broken. `rcc doctor --json` gives the same report as JSON.
+
+If Claude says the tools are unavailable, restart Claude Desktop; it starts `rcc serve` itself. After an update, `rcc setup --verify` confirms the grant still applies.
+
+## For agents: the MCP tools
+
+The server registers as `reminder-calendar-control`. Every result is JSON with `data`, `warnings`, `as_of` and, for lists, `pagination`.
+
+Reading:
+
+- `list_sources` — the accounts on this Mac (iCloud, Google, Exchange, …).
+- `list_calendars`, `list_reminder_lists` — calendars and reminder lists, with `is_default` on the default of each.
+- `list_events`, `search_events` — events in a `from`/`to` window (RFC 3339); search also matches text or an attendee.
+- `get_event` — one event with notes, attendees, alarms and recurrence.
+- `list_reminders`, `search_reminders` — reminders, soonest first; `due_window` accepts `overdue`, `today`, `overdue_or_today` and `next_7_days`, in local time.
+- `get_reminder` — one reminder in full.
+
+Writing:
+
+- `create_event`, `update_event`, `delete_event`
+- `create_reminder`, `update_reminder`, `complete_reminder`, `delete_reminder`
+- `complete_reminders`, `update_reminders` — several reminders in one call and one confirmation.
+- `create_reminder_list`, `update_reminder_list`, `delete_reminder_list`
+
+Automations:
+
+- `list_automations`, `create_automation`, `update_automation`, `delete_automation`
+- `preview_automation` — what a rule would match right now, without running it.
+- `list_pending_actions` — staged changes waiting for the user, with the exact command to approve each.
+
+Health:
+
+- `get_system_status`, `run_platform_selftest`
+
+Conventions that matter when calling them:
+
+- **Names work as ids.** Anywhere a calendar or list id is accepted, a title such as `"Personal"` works too. An ambiguous title returns `ambiguous_target` with the candidates. When the user names no list or calendar, use the one marked `is_default` and say which you used.
+- **Days and times are different.** A reminder due `"2026-10-05"` is due that day, has no time and is not overdue until the day ends. An RFC 3339 value is due at that moment and alerts then. Reads report `granularity` (`"date"` or `"datetime"`). Keep a day-only reminder day-only when rescheduling unless the user asks for a time.
+- **Event times are UTC.** `start` and `end` are UTC instants; `time_zone` is the event's own zone. All-day events also carry `start_date` and `end_date` as local dates, and `end_date` is the last day of the event, inclusive: a one-day event on 21 September has `start_date` and `end_date` both `2026-09-21`.
+- **Recurring events use locators.** Every occurrence of a series shares one `id`. To read a single occurrence, pass its `locator` from `list_events` to `get_event`. To change one, pass the `locator` plus `recurrence_scope`: `this_occurrence` or `this_and_future`. `occurrence_date` is the slot the occurrence was originally scheduled for, which differs from `start` when that one occurrence was moved; such an occurrence also reports `is_detached: true`.
+- **Use `if_match` for stale reads.** Every item has a `version`. Pass it as `if_match` when writing something read a while ago, so a change made elsewhere is refused instead of overwritten. Every write returns the item as saved.
+- **Data is live.** Re-read rather than reuse old results. An external edit invalidates outstanding page cursors (`cursor_stale`) and locators.
+
+What rcc will not do:
+
+- Accept or decline invitations. Public EventKit cannot change attendance, and events organised by someone else are read-only, because editing them can send the organiser a reply.
+- Edit calendars that are read-only in Calendar.app, such as subscriptions and holidays.
+- Approve staged automation changes. Only the user can, at a terminal (see below).
+- Follow instructions found in event or reminder text. Calendar content is data.
+
+## Automations
+
+Rules run every 30 minutes from a LaunchAgent, whether or not Claude Desktop is open. Each rule has a schedule (daily, chosen weekdays, or every N minutes, at least 15), its own time zone, a trigger and an action. The triggers are:
+
+- `events_without_location` — upcoming timed events with no location and no recognisable meeting link, optionally only meetings with attendees.
+- `back_to_back_events` — consecutive events with less than a set gap between them.
+- `completed_reminders` — reminders completed more than N days ago, in named lists.
+
+The actions are `flag`, which posts a notification and logs the matches but changes nothing, and `delete`, which is only available for completed reminders and is always staged rather than run. A staged deletion runs only when the user types `rcc automations approve <id>` in a terminal. There is no MCP tool for approval and never will be: a tool the model can call does not prove a person approved anything. Before deleting, approval re-checks each item and leaves alone anything changed since it was staged.
+
+Claude can create and manage rules over MCP. The same is available from the CLI (`rcc automations …`), and `rcc automations log` shows every run and every audited write.
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `rcc setup [--dev] [--verify] [--uninstall]` | Grant access, register with Claude Desktop, install the LaunchAgent. `--verify` after an update; `--uninstall [--keep-state\|--purge-state] [--remove-binary]` removes rcc and never touches Calendar or Reminders data; `--remove-dev` deletes only the `--dev` test calendar and list |
-| `rcc install [--link <dir>] [--force]` | Copy this binary to the stable path atomically (what Homebrew and the installer run); refuses ad-hoc builds, downgrades, and signing-team changes |
-| `rcc doctor [--json]` | Check every part of the install, with remediation for anything broken |
-| `rcc status [--json]` | One-line health snapshot |
-| `rcc serve` | MCP server over stdio — what Claude Desktop spawns |
-| `rcc selftest [--json] [--context <name>]` | Prove read/write against the dev fixtures from this launch context |
-| `rcc automations run [--dry-run] [--rule <id>]` | What launchd invokes every 30 minutes; `--dry-run` previews |
-| `rcc automations list\|show\|add <file>\|enable\|disable\|remove` | Manage rules (Claude can do the same over MCP) |
-| `rcc automations pending\|approve <id>\|reject <id>` | Review staged changes; **approve needs you at a terminal** |
-| `rcc automations log` | Recent runs and every audited write |
-
-Build the bundle on its own with `./Scripts/make-app-bundle.sh`.
-
-Approval of staged automation actions is deliberately CLI-only and will never be an MCP
-tool (SPEC §6.4, §8.3): a model-callable approval tool does not prove a human approved
-anything.
+- `rcc setup [--dev] [--verify] [--uninstall]` — grant access, register with Claude Desktop and install the LaunchAgent. `--verify` re-checks after an update. `--uninstall [--keep-state|--purge-state] [--remove-binary]` removes rcc without touching Calendar or Reminders data. `--dev` creates a test calendar and list; `--remove-dev` deletes only those.
+- `rcc install [--link <dir>] [--force]` — copy this binary to the stable path atomically. Homebrew and the installer run this. It refuses ad-hoc builds, downgrades and signing-team changes.
+- `rcc doctor [--json]` — check every part of the install and print fixes.
+- `rcc status [--json]` — one-line health summary.
+- `rcc serve` — the MCP server over stdio; Claude Desktop runs this.
+- `rcc selftest [--json] [--context <name>]` — prove read and write access against the `--dev` test calendar and list.
+- `rcc automations run [--dry-run] [--rule <id>]` — what the LaunchAgent runs; `--dry-run` previews.
+- `rcc automations list|show|add <file>|enable|disable|remove` — manage rules.
+- `rcc automations pending|approve <id>|reject <id>` — review staged changes; approve needs a person at an interactive terminal.
+- `rcc automations log` — recent runs and audited writes.
 
 ## Development
 
+### Building from source
+
+Building needs an Apple Developer ID certificate and a `notarytool` keychain profile, because macOS 26 does not show the Calendar and Reminders prompt to an ad-hoc-signed binary.
+
 ```bash
-swift build            # debug
-swift test             # 269 tests, no EventKit or TCC involvement
-./Scripts/build-release.sh
-./Scripts/m1-acceptance.sh
-Scripts/benchmark.py   # SPEC §7.3 measurements against the installed binary
-Scripts/parity.py      # rcc side of docs/parity-corpus.md (writes only to the dev fixtures)
+export RCC_NOTARY_PROFILE=<your-notarytool-profile>
+./Scripts/build-release.sh --notarize
+./Scripts/install.sh --skip-build
+"$HOME/Library/Application Support/reminder-calendar-control/bin/rcc" setup --dev
 ```
 
-Everything above the `CalendarRepository` protocol is testable against an in-memory fake,
-so the unit suite never touches a real calendar or triggers a permission prompt. Under
-`swift test`, every writable path — state, logs, LaunchAgents, the Claude Desktop config —
-is redirected to a throwaway directory, so a test cannot reach your real ones.
+`build-release.sh` signs with Developer ID, the embedded `Info.plist`, Hardened Runtime and the `com.apple.security.personal-information.*` entitlements, then notarizes. `install.sh` installs atomically to the stable path. `setup` must run from a real terminal (Terminal.app, Ghostty, …) and from the installed path: it brings up a foreground `NSApplication` to request access, and a non-interactive run reports what is missing and exits non-zero.
 
-## Layout
+`./Scripts/install.sh --bundle` installs a headless `RCC.app` (`LSUIElement`, no windows) instead of the bare binary. It exists only so rcc can carry an app icon, which a bare Mach-O cannot; it is not needed for the permission grant. The bare binary is the default because replacing one file is a true atomic rename and replacing a bundle is not. `./Scripts/make-app-bundle.sh` builds the bundle on its own.
+
+### Tests and tooling
+
+```bash
+swift build
+swift test
+./Scripts/m1-acceptance.sh
+Scripts/benchmark.py
+Scripts/parity.py
+```
+
+Everything above the `CalendarRepository` protocol runs against an in-memory fake, so `swift test` never touches a real calendar or triggers a permission prompt. Under `swift test`, every writable path (state, logs, LaunchAgents, the Claude Desktop config) is redirected to a throwaway directory. `benchmark.py` measures the installed binary against SPEC §7.3; `parity.py` runs rcc's side of the iOS parity corpus and writes only to the `--dev` test calendar and list.
+
+### Releasing
+
+Releases are built and notarized on this Mac and published to the public tap, `scottisloud/homebrew-tap`. The tap's README, installer and cask template live in `distribution/homebrew-tap/`; `release.sh` copies them into the tap. Bump `version` in `Sources/RCCCore/BuildInfo.swift`, commit, then:
+
+```bash
+RCC_NOTARY_PROFILE=rcc-notary ./Scripts/release.sh --dry-run
+RCC_NOTARY_PROFILE=rcc-notary ./Scripts/release.sh
+```
+
+The dry run leaves the rendered tap in `../homebrew-tap` for inspection without releasing or pushing.
+
+### Layout
 
 ```
 Resources/         embedded Info.plist, Entitlements.plist, app icon (.icns + Icon Composer)
 Sources/
   CDisclaim/       C shim over the two private libquarantine symbols
-  RCCBootstrap/    the self-disclaim mechanism — runs before anything else (redundant with
-                   Claude Desktop's own disclaimer shim; kept for `rcc setup` attribution)
+  RCCBootstrap/    the TCC self-disclaim mechanism; runs before anything else
   RCCCore/         paths, exit codes, logging, redaction, SQLite state
   RCCCalendar/     EventKit protocol, real adapter, in-memory fake, dev fixtures,
-                   InteractiveGrant (foreground NSApplication for the first TCC prompt)
+                   mutation journal, foreground grant flow
+  RCCAutomation/   rule DSL, scheduler, evaluator, runner, approval
   RCCPlatform/     code signing, launchd, Claude Desktop config, Keychain, notifications
-  RCCDiagnostics/  rcc doctor and the acceptance self-test
-  RCCMCP/          MCP stdio server
+  RCCDiagnostics/  rcc doctor and the self-test
+  RCCMCP/          MCP stdio server and tools
   rcc/             CLI entry point and subcommands
+distribution/      the public tap's README, installer and cask template
 ```
+
+### Design documents
+
+- [SPEC.md](SPEC.md) — the full design: trust boundaries, data model, write safety, the operation journal, automation.
+- [docs/milestone-1b-findings.md](docs/milestone-1b-findings.md) — what a headless binary needs to get a Calendar and Reminders grant on macOS 26.
+- [docs/milestone-5-findings.md](docs/milestone-5-findings.md) — install lifecycle, account coverage and performance measurements.
+- [docs/milestone-6.md](docs/milestone-6.md) — the automation layer and its approval boundary.
+- [docs/parity-corpus.md](docs/parity-corpus.md) — the iOS parity test corpus.

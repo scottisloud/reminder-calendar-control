@@ -13,11 +13,11 @@
 #   * macOS reads an app icon from Contents/Resources/<CFBundleIconFile>.icns. There is no
 #     linker section for icon data, so a bare Mach-O cannot carry one. The TCC dialog and
 #     the System Settings > Privacy entry both render that icon.
-#   * UserNotifications is unreachable from a bundle-less executable (docs/milestone-1.md
-#     §5.10a), so the notification story in SPEC §6.1 needs this shape eventually.
+#   * UserNotifications is unreachable from a bundle-less executable, so the notification
+#     story in SPEC §6.1 needs this shape eventually.
 #
 # What it does NOT do: fix the TCC blocker. Measured directly — a headless .app, disclaimed,
-# exec'd directly, still gets `granted=false` with no dialog (docs/milestone-1.md §1.0).
+# exec'd directly, still gets `granted=false` with no dialog.
 # This is packaging, not a workaround.
 #
 # The bare binary remains the default install. Bundle install has a brief window where the

@@ -170,7 +170,7 @@ struct Setup: AsyncParsableCommand {
     /// The request goes through `InteractiveGrant`, which runs a foreground `NSApplication`
     /// run loop: on macOS 14+ a bare CLI async request is denied with no dialog, and on
     /// macOS 26.5+ tccd also needs the `personal-information` entitlements the signed binary
-    /// now carries (docs/milestone-1b-findings.md). A non-interactive invocation
+    /// now carries (SPEC §6.3). A non-interactive invocation
     /// (LaunchAgent, piped) never spins up AppKit — it reports what is missing and stops.
     private func grantAccess(using repository: EventKitRepository) async throws {
         let entities = RCCEntityType.allCases
@@ -222,7 +222,7 @@ struct Setup: AsyncParsableCommand {
                     "\(entityType.displayName) access was not granted (\(why)).",
                     remediation: "Re-run `rcc setup`. If no dialog appears at all, check "
                         + "System Settings › Privacy & Security › \(entityType.displayName) for an `rcc` "
-                        + "entry, and see docs/milestone-1b-findings.md."
+                        + "entry, and run `rcc doctor`."
                 )
             }
             Output.line("  \(entityType.displayName) access: granted")

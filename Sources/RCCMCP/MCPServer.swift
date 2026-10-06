@@ -11,7 +11,7 @@ import RCCDiagnostics
 /// a couple of hundred lines, it is pre-1.0 with breaking minor bumps, and fewer
 /// third-party binaries inside a notarized artifact is strictly better. The seam is kept
 /// narrow — a method dispatch table plus `ProtocolIO` — so adopting the SDK later is a
-/// swap, not a rewrite. See docs/milestone-1.md.
+/// swap, not a rewrite.
 ///
 /// **Milestone 1 scope.** Two tools, both about proving the platform works from inside the
 /// process Claude Desktop actually spawns. The read/write tool surface in SPEC §10 lands

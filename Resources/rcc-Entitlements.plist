@@ -5,8 +5,8 @@
     Calendar/Reminders prompt for a Hardened-Runtime binary that lacks the matching
     `com.apple.security.personal-information.*` entitlement — the request is denied
     with no dialog and `authorizationStatus` stays `.notDetermined` forever
-    ("Policy disallows prompt ... access denied"). This is what
-    docs/milestone-1b-findings.md measured, and it reverses SPEC §6.3's original
+    ("Policy disallows prompt ... access denied"). This was
+    measured directly, and it reverses SPEC §6.3's original
     "ship no entitlements" decision, which was correct only through macOS 26.4.
 
     Both keys are UNRESTRICTED entitlements: valid for Developer ID distribution

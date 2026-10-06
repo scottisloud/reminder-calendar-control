@@ -79,8 +79,8 @@ let package = Package(
             swiftSettings: commonSwiftSettings
         ),
 
-        // Hand-rolled MCP stdio server. See docs/milestone-1.md for why this is not the
-        // official Swift SDK.
+        // Hand-rolled MCP stdio server rather than the official Swift SDK; MCPServer.swift
+        // says why.
         .target(
             name: "RCCMCP",
             dependencies: ["RCCAutomation", "RCCCalendar", "RCCCore", "RCCDiagnostics"],

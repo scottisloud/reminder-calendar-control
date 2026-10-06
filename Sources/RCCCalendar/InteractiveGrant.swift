@@ -4,8 +4,7 @@ import Foundation
 import RCCCore
 
 /// Requests Calendar/Reminders full access from inside a foreground `NSApplication` so
-/// macOS actually presents its TCC dialogs (SPEC §6.2 revision — see
-/// docs/milestone-1b-findings.md).
+/// macOS actually presents its TCC dialogs (SPEC §6.2a).
 ///
 /// Two independently-measured facts drive this:
 ///
@@ -64,8 +63,8 @@ public enum InteractiveGrant {
         }
 
         // Explicit pump rather than `app.run()` / `RunLoop.main.run(until:)`: both were
-        // measured to hang once an AppKit observer is live on this codebase
-        // (docs/milestone-1.md §5.7). `run(mode:before:)` with a short horizon returns
+        // measured to hang once an AppKit observer is live on this codebase.
+        // `run(mode:before:)` with a short horizon returns
         // control every tick so the deadline is honoured.
         let deadline = Date().addingTimeInterval(timeout)
         while !state.isEmpty, Date() < deadline {

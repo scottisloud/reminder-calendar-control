@@ -351,7 +351,7 @@ public actor EventKitRepository: CalendarRepository {
     /// The paged form of `listEvents` + `EventQuery.matches`. Filtering and ordering run on
     /// a light conversion; only the page pays for alarms, recurrence rules, and attendees —
     /// lazily loaded relations that cost a calaccessd round trip each. Measured on 8,673
-    /// occurrences: 16.8 s → see docs/milestone-5-findings.md. The `EKEvent`s live only for
+    /// occurrences: 16.8 s → 0.83 s for a 3-year listing. The `EKEvent`s live only for
     /// this call (§7.4).
     public func queryEvents(_ query: EventQuery) async throws -> QueryPage<EventSummary> {
         try requireFullAccess(.event)
@@ -661,7 +661,7 @@ public actor EventKitRepository: CalendarRepository {
     /// turning, and the block runs synchronously on that queue. `onChange` must therefore
     /// be thread-safe — the caller uses it only to bump a `FULLMUTEX` SQLite counter.
     /// Deliberately NOT the typed `EKEventStore.EventStoreChanged` API, which SIGTRAPs when
-    /// the notification is posted off the main thread (docs/milestone-1.md §5.7).
+    /// the notification is posted off the main thread.
     ///
     /// This does not recreate the store: `rcc` keeps no TTL cache (§7.4), converts every
     /// fetched object to a value immediately, and re-runs each predicate per request, so a

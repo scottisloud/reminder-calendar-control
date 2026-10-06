@@ -49,7 +49,7 @@ struct MCPServerTests {
 
     /// SPEC §10.1 names revision 2026-07-28, which abolished the `initialize` handshake
     /// entirely. The shipping Claude Desktop still sends `initialize` and negotiates
-    /// 2025-11-25, so that is what this server answers. See docs/milestone-1.md.
+    /// 2025-11-25, so that is what this server answers.
     @Test("An unknown protocol version falls back to ours, not to theirs")
     func fallsBackToPreferredVersion() {
         let result = MCPServer.initializeResult(for: [

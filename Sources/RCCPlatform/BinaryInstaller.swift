@@ -7,7 +7,7 @@ import RCCCore
 /// This is what makes a package manager or a downloaded zip a delivery vehicle rather than
 /// a second install location. Homebrew keeps its copy in the Caskroom; macOS records the
 /// Calendar/Reminders grant against a binary's path plus its designated requirement
-/// (docs/milestone-5-findings.md), so every copy that is *run* has to be the one at the
+/// (SPEC §6.1), so every copy that is *run* has to be the one at the
 /// stable path. A downloaded `rcc` therefore installs itself there and gets out of the way.
 ///
 /// The same rules as `Scripts/install.sh`:

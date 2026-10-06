@@ -136,7 +136,7 @@ The installed binary's code hash changed ($PREVIOUS_CDHASH -> $NEW_CDHASH).
 
 Under an ad-hoc signature the designated requirement is the code hash itself, so macOS has
 just invalidated the Calendar and Reminders grants. You will be re-prompted. This is
-expected for an unsigned local build, not a bug — see docs/milestone-1.md.
+expected for an unsigned local build, not a bug.
 BANNER
 fi
 

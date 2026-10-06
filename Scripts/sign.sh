@@ -24,7 +24,7 @@
 #
 # Entitlements: rcc ships `com.apple.security.personal-information.{calendars,reminders}`.
 # macOS 26.5 will not present a Calendar/Reminders TCC prompt for a Hardened-Runtime binary
-# that lacks them (see docs/milestone-1b-findings.md). They are unrestricted keys — no
+# that lacks them (SPEC §6.3). They are unrestricted keys — no
 # provisioning profile, no App Sandbox. Do NOT add `com.apple.security.app-sandbox`: true
 # kills a bare CLI with SIGTRAP before main(); false is a cdhash-churning no-op.
 set -euo pipefail
@@ -106,7 +106,6 @@ if [ "$ADHOC" -eq 1 ]; then
 #  Any rebuild produces a new cdhash, invalidating the Calendar/Reminders TCC   #
 #  grant and any Keychain ACL, so macOS re-prompts after every reinstall.       #
 #  Cannot be notarized. Does NOT satisfy SPEC §18 Milestone 1's release gate.   #
-#  See docs/milestone-1.md for the M1a / M1b split.                             #
 ################################################################################
 BANNER
 fi
@@ -165,7 +164,7 @@ printf '%s\n' "$DISPLAY_INFO" | grep -q 'linker-signed' \
 printf '%s\n' "$DISPLAY_INFO" | grep -q '^Info.plist entries=' \
   || die "Info.plist is not sealed into the signature"
 
-# The whole reason this file exists (docs/milestone-1b-findings.md): without these keys,
+# The whole reason this file exists (SPEC §6.3): without these keys,
 # macOS 26.5 will not present a Calendar/Reminders prompt for a Hardened-Runtime binary.
 if [ "$WANT_ENTITLEMENTS" -eq 1 ]; then
   ENT_DUMP="$(codesign --display --entitlements - --xml "$BINARY" 2>/dev/null | plutil -convert xml1 -o - - 2>/dev/null || true)"

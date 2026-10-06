@@ -162,7 +162,7 @@ public struct Doctor: Sendable {
                 remediation: "An ad-hoc signature's designated requirement is a bare cdhash, which changes on "
                     + "every rebuild — so the Calendar and Reminders grants are invalidated each time you "
                     + "reinstall, and you will be re-prompted. This is expected until a Developer ID "
-                    + "certificate is available; see docs/milestone-1.md.",
+                    + "certificate is available.",
                 facts: facts
             )
         }
@@ -296,7 +296,7 @@ public struct Doctor: Sendable {
                 ? nil
                 : "A locally built binary runs fine (never quarantined), but notarization is "
                     + "part of the known-good macOS 26 recipe for TCC prompts to appear. Ship "
-                    + "with Scripts/build-release.sh --notarize. See docs/milestone-1b-findings.md.",
+                    + "with Scripts/build-release.sh --notarize.",
             facts: ["probe": detail, "path": path]
         )
     }
@@ -331,8 +331,8 @@ public struct Doctor: Sendable {
             if signature?.isAdHoc == true, disclaim?.outcome.isHealthy == true {
                 remediation += "\n\nKnown issue for this build: rcc is ad-hoc signed, and a disclaimed "
                     + "ad-hoc process appears unable to obtain a grant on macOS 26 — the request is "
-                    + "denied immediately with no dialog. A Developer ID signature is expected to fix "
-                    + "it. See docs/milestone-1.md §1.0."
+                    + "denied immediately with no dialog. Build with Scripts/build-release.sh --notarize "
+                    + "for a Developer ID signature and the entitlements macOS requires."
             }
         case .denied:
             remediation = "Grant access in System Settings › Privacy & Security › \(entityType.displayName), "

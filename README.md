@@ -203,7 +203,4 @@ distribution/      the public tap's README, installer and cask template
 ### Design documents
 
 - [SPEC.md](SPEC.md) — the full design: trust boundaries, data model, write safety, the operation journal, automation.
-- [docs/milestone-1b-findings.md](docs/milestone-1b-findings.md) — what a headless binary needs to get a Calendar and Reminders grant on macOS 26.
-- [docs/milestone-5-findings.md](docs/milestone-5-findings.md) — install lifecycle, account coverage and performance measurements.
-- [docs/milestone-6.md](docs/milestone-6.md) — the automation layer and its approval boundary.
 - [docs/parity-corpus.md](docs/parity-corpus.md) — the iOS parity test corpus.

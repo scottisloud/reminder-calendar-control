@@ -16,7 +16,7 @@
 #   * an event and a reminder were written to the dev fixtures, read back, and deleted
 #
 # It does NOT cover the Developer ID / notarization half of the gate; that needs a signing
-# certificate this machine does not have. See docs/milestone-1.md for the M1a / M1b split.
+# certificate; build with Scripts/build-release.sh --notarize for that.
 #
 # Prerequisites: Scripts/install.sh, then `<installed rcc> setup --dev`.
 set -uo pipefail
@@ -279,7 +279,7 @@ log 'Summary'
 if [ "$FAILURES" -eq 0 ]; then
   printf '  Milestone 1 PASSED — all three launch contexts read and wrote the dev fixtures,\n'
   printf '  and rcc doctor is healthy. Run against a Developer-ID-signed, entitled, notarized\n'
-  printf '  build for the full M1b gate; see docs/milestone-1b-findings.md.\n'
+  printf '  build (Scripts/build-release.sh --notarize) for the full gate.\n'
   printf '  Results: %s\n' "$RESULTS_DIR"
   exit 0
 fi

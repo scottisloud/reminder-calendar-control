@@ -12,7 +12,7 @@ import Foundation
 /// third-party server's tool descriptor from scratch and drops `_meta`, `title`,
 /// `outputSchema`, and every annotation except `readOnlyHint`. SPEC §17 lists confirming
 /// Desktop's behaviour as an open question; it is answered, and the answer is "it does not
-/// honour it". See docs/milestone-1.md.
+/// honour it".
 public enum Tools {
     public static let getSystemStatus = "get_system_status"
     public static let runPlatformSelfTest = "run_platform_selftest"

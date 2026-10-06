@@ -55,7 +55,7 @@ public protocol CalendarRepository: Sendable {
     /// Exists for cost, not semantics: it must return exactly what `listEvents` + filter +
     /// slice would, but an adapter can do the filtering and ordering on cheap fields and
     /// fully convert only the page — the difference between 16 s and well under one for a
-    /// few thousand occurrences in EventKit (docs/milestone-5-findings.md).
+    /// few thousand occurrences in EventKit.
     func queryEvents(_ query: EventQuery) async throws -> QueryPage<EventSummary>
     /// One event. With `occurrenceDate`, that specific occurrence of a recurring series, or
     /// `nil` if the series has no occurrence there — never a different one.

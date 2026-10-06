@@ -290,7 +290,7 @@ Naming convention: `verb_noun`, plural for list operations, singular for single-
 **Calendars & events**
 - `list_calendars` — writability flags (§9.3).
 - `list_sources`
-- `list_events` / `search_events` — **require** a bounded date range (chunked automatically past four years, §9.4); paginated.
+- `list_events` / `search_events` — **require** a bounded date range: a named `window` (`today`, `tomorrow`, `next_7_days`, resolved in local time) or an explicit `from`/`to`, never both (chunked automatically past four years, §9.4); paginated. Timed events also return `start_local`/`end_local` in the Mac's zone; every event returns `part_of_series` and `spans_multiple_days`, and `occurrence_date` only for occurrences in a series.
 - `get_event`
 - `create_event` — **[v4]** requires an explicit target calendar; no implicit default. A duplicate display name across calendars returns `ambiguous_target` with candidates.
 - `update_event`, `delete_event` — require `recurrence_scope` on a recurring item and `if_match` (§9.4); high-impact mutations follow §8.3's per-context policy.

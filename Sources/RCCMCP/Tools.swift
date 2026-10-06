@@ -17,6 +17,10 @@ public enum Tools {
     public static let getSystemStatus = "get_system_status"
     public static let runPlatformSelfTest = "run_platform_selftest"
 
+    /// Every tool this server answers to.
+    static let knownNames = Set([getSystemStatus, runPlatformSelfTest])
+        .union(ReadTools.names).union(WriteTools.names).union(AutomationTools.names)
+
     public static var descriptors: [[String: Any]] {
         [
             [

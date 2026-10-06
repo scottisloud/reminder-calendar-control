@@ -132,7 +132,11 @@ public struct MCPServer: Sendable {
         case "tools/list":
             return Self.successResponse(id: identifier, result: ["tools": Tools.descriptors])
         case "tools/call":
-            switch await callTool(message["params"] as? [String: Any] ?? [:]) {
+            let params = message["params"] as? [String: Any] ?? [:]
+            let started = Date()
+            let outcome = await callTool(params)
+            Self.logToolCall(name: params["name"] as? String, outcome: outcome, started: started)
+            switch outcome {
             case .success(let payload):
                 return Self.successResponse(id: identifier, result: payload)
             case .protocolError(let code, let text):
@@ -146,6 +150,30 @@ public struct MCPServer: Sendable {
     enum ToolOutcome {
         case success([String: Any])
         case protocolError(Int, String)
+    }
+
+    /// One line per tool call — name, outcome, duration, never arguments or results — so a
+    /// failure the client reports can be matched against what this server actually saw,
+    /// including whether the call arrived at all.
+    static func logToolCall(name: String?, outcome: ToolOutcome, started: Date) {
+        // The name is client-supplied; log it only if it is one of ours.
+        let tool = name.flatMap { Tools.knownNames.contains($0) ? $0 : nil } ?? "unknown"
+        var fields: [String: Log.Value] = [
+            "tool": .safe(tool),
+            "duration_ms": .int(Int(Date().timeIntervalSince(started) * 1000)),
+        ]
+        switch outcome {
+        case .success(let result):
+            let failed = result["isError"] as? Bool ?? false
+            fields["outcome"] = .safe(failed ? "error" : "ok")
+            if failed, let code = (result["structuredContent"] as? [String: Any])?["code"] as? String {
+                fields["code"] = .safe(code)
+            }
+        case .protocolError(let code, _):
+            fields["outcome"] = .safe("protocol_error")
+            fields["code"] = .int(code)
+        }
+        Log.shared.info("mcp.tool_call", fields)
     }
 
     private func callTool(_ params: [String: Any]) async -> ToolOutcome {
@@ -294,8 +322,8 @@ public struct MCPServer: Sendable {
         Read/write access to this Mac's Calendar and Reminders (every account the Mac has: \
         iCloud, Google, Exchange, ...). Data is live — re-read rather than reuse old results.
 
-        Finding things: list_reminders with due_window "overdue_or_today" answers "what's on \
-        my plate". Calendars and reminder lists can be named by title anywhere an id is \
+        Finding things: list_reminders with due_window "overdue_or_today" and list_events \
+        with window "today" together answer "what's on my plate". Calendars and reminder lists can be named by title anywhere an id is \
         accepted ("Personal", "Work"); an ambiguous name returns ambiguous_target with the \
         candidates. When the user names no list or calendar, use the one marked \
         `is_default` in list_reminder_lists / list_calendars, and say which you used.
@@ -305,7 +333,8 @@ public struct MCPServer: Sendable {
         that moment and gets an alert at that time by default. Keep a day-only reminder \
         day-only when rescheduling it unless asked for a time. Read results report \
         `granularity` ("date" or "datetime") so you can tell which you have. Use the user's \
-        local zone when they name a time.
+        local zone when they name a time. Event `start`/`end` are UTC; show the user \
+        `start_local`/`end_local` (timed) or `start_date`/`end_date` (all-day, inclusive).
 
         Writing: pass `identifier` (or `locator`) from a read. Pass the item's `version` as \
         `if_match` when acting on something you read a while ago, so a change made \

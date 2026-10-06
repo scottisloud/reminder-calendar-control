@@ -298,7 +298,7 @@ struct Setup: AsyncParsableCommand {
             }
         }
         Output.line("")
-        Output.line("`rcc selftest` and Scripts/parity.py need them; `rcc setup --dev` recreates them.")
+        Output.line("`rcc selftest` needs them; `rcc setup --dev` recreates them.")
     }
 
     // MARK: - Uninstall

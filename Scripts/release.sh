@@ -6,7 +6,7 @@
 #
 # The tap repo (scottisloud/homebrew-tap) holds only what users download: the cask, the
 # curl installer, its README, and the notarized `rcc.zip` attached to a GitHub Release
-# tagged `rcc-v<version>`. Source stays in this private repo. Signing needs this Mac's
+# tagged `rcc-v<version>`. Source stays in this repo. Signing needs this Mac's
 # Developer ID, so releases are cut here rather than in CI.
 #
 # Steps: refuse a dirty tree or an existing tag → build-release.sh --notarize → confirm
